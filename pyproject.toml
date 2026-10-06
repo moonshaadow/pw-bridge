@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pw-bridge"
+version = "0.1.0"
+description = "Shared PipeWire C bridge and Python bindings for PCC and Patchanka"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "GPL-2.0-or-later"}
+authors = [
+    {name = "A. Vartanian"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+
+[tool.setuptools]
+packages = ["pw_bridge"]
