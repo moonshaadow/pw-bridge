@@ -1,33 +1,49 @@
 # pw-bridge
 
-Shared PipeWire C bridge and Python bindings for PCC and Patchanka.
+Shared PipeWire C bridge and Python bindings for
+[Patchanka](https://github.com/moonshaadow/Patchanka) and
+[PipeWire Control Center](https://github.com/moonshaadow/pipewire-control-center).
 
-## Components
+A small C wrapper exposes the PipeWire functions that are
+`static inline` in the headers and therefore not exported by
+`libpipewire-0.3.so.0`. Everything else is called directly from
+Python via ctypes.
 
-- `native/pw_bridge.c` : C wrapper exposing PipeWire functions that cannot be called directly via ctypes (static inline functions).
-- `pw_bridge/pw_bindings.py` : ctypes bindings for libpipewire-0.3 and the C wrapper.
-- `pw_bridge/registry.py` : high-level registry and event manager.
+## Requirements
+
+- Linux with PipeWire 1.0+
+- Python 3.8+
+- `libpipewire-0.3-dev`
 
 ## Build
 
 ```bash
 cd native
-make
+./build.sh
 ```
-This produces libpw_bridge.so.
+
+This produces `native/libpw_bridge.so`, which the Python package
+loads automatically.
 
 ## Usage
 
-```bash
+```python
 from pw_bridge import PipeWireRegistry
-from pw_bridge import pw_bindings as pw
 
 registry = PipeWireRegistry(
-    on_global_added=...,
-    on_global_removed=...,
+    on_global_added=lambda oid, t, props: print(oid, t),
+    on_global_removed=lambda oid: print("gone", oid),
 )
 registry.start()
+# ...
+registry.stop()
 ```
+
+## Documentation
+
+See [docs/pw-bridge_API_ref_0.2.md](docs/pw-bridge_API_ref_0.2.md)
+for the full API reference.
+
 ## License
 
-GPL v2 or later
+GPL-2.0-or-later.
