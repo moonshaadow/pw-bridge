@@ -1,4 +1,3 @@
-$ git show develop:pw_bridge/__init__.py
 """Shared PipeWire bridge for PCC and Patchanka.
 
 This package provides:
