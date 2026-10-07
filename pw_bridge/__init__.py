@@ -6,7 +6,9 @@ This package provides:
 - a high-level registry/event manager (via registry)
 """
 
+__version__ = "0.2"
+
 from . import pw_bindings
 from .registry import PipeWireRegistry
 
-__all__ = ['pw_bindings', 'PipeWireRegistry']
+__all__ = ['pw_bindings', 'PipeWireRegistry', '__version__']
