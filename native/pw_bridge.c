@@ -1,11 +1,20 @@
 /* pw_bridge.c
  *
- * Minimal C wrapper exposing the PipeWire functions needed by
- * applications that cannot call them directly through ctypes
- * (static inline functions in the PipeWire headers).
+ * C wrapper exposing the PipeWire functions needed by applications
+ * that cannot call them directly through ctypes (static inline
+ * functions in the PipeWire headers, or functions requiring
+ * per-instance user_data routing).
  *
  * This wrapper is designed to be reusable: it has no dependency
  * on any specific application and only requires libpipewire.
+ *
+ * GIL handling: all callbacks invoked from the PipeWire thread loop
+ * acquire the Python GIL via PyGILState_Ensure / PyGILState_Release.
+ *
+ * Only functions that are static inline in the PipeWire headers are
+ * wrapped here. Anything exported by libpipewire-0.3.so.0 (such as
+ * pw_proxy_destroy, pw_core_disconnect, pw_context_new, etc.) is
+ * called directly via ctypes and does not appear in this file.
  *
  * Build:
  *   make
@@ -18,9 +27,29 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <Python.h>
+
 
 /* ====================================================================
- * Registry: creation
+ * Library version
+ * ==================================================================== */
+
+const char *pw_bridge_version(void)
+{
+    return pw_get_library_version();
+}
+
+uint32_t pw_bridge_version_registry(void) { return PW_VERSION_REGISTRY; }
+uint32_t pw_bridge_version_core(void)     { return PW_VERSION_CORE; }
+uint32_t pw_bridge_version_link(void)     { return PW_VERSION_LINK; }
+uint32_t pw_bridge_version_node(void)     { return PW_VERSION_NODE; }
+uint32_t pw_bridge_version_port(void)     { return PW_VERSION_PORT; }
+uint32_t pw_bridge_version_client(void)   { return PW_VERSION_CLIENT; }
+uint32_t pw_bridge_version_device(void)   { return PW_VERSION_DEVICE; }
+
+
+/* ====================================================================
+ * Registry
  * ==================================================================== */
 
 struct pw_registry *pw_bridge_get_registry(struct pw_core *core)
@@ -28,9 +57,22 @@ struct pw_registry *pw_bridge_get_registry(struct pw_core *core)
     return pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
 }
 
+int pw_bridge_registry_destroy(struct pw_registry *registry, uint32_t id)
+{
+    if (registry == NULL)
+        return -1;
+    return pw_registry_destroy(registry, id);
+}
+
+/* Kept as a compatibility alias for existing callers. */
+int pw_bridge_destroy_link(struct pw_registry *registry, uint32_t link_id)
+{
+    return pw_bridge_registry_destroy(registry, link_id);
+}
+
 
 /* ====================================================================
- * Registry: listener
+ * Registry listener: per-instance callbacks and user_data
  * ==================================================================== */
 
 typedef void (*pw_bridge_global_cb_t)(
@@ -45,54 +87,88 @@ typedef void (*pw_bridge_global_remove_cb_t)(
     void *user_data,
     uint32_t id);
 
-static pw_bridge_global_cb_t        g_global_cb        = NULL;
-static pw_bridge_global_remove_cb_t g_global_remove_cb = NULL;
-static void                        *g_user_data        = NULL;
-
-static void _global_cb_relay(void *data, uint32_t id, uint32_t permissions,
-                             const char *type, uint32_t version,
-                             const struct spa_dict *props)
-{
-    if (g_global_cb != NULL)
-        g_global_cb(g_user_data, id, permissions, type, version, props);
-    (void)data;
-}
-
-static void _global_remove_cb_relay(void *data, uint32_t id)
-{
-    if (g_global_remove_cb != NULL)
-        g_global_remove_cb(g_user_data, id);
-    (void)data;
-}
-
-static struct pw_registry_events g_registry_events = {
-    .version = PW_VERSION_REGISTRY_EVENTS,
-    .global = _global_cb_relay,
-    .global_remove = _global_remove_cb_relay,
+struct pw_bridge_registry_listener {
+    struct spa_hook               hook;
+    pw_bridge_global_cb_t         global_cb;
+    pw_bridge_global_remove_cb_t  global_remove_cb;
+    void                         *user_data;
 };
 
-void pw_bridge_set_registry_callbacks(
-    pw_bridge_global_cb_t global_cb,
-    pw_bridge_global_remove_cb_t global_remove_cb,
-    void *user_data)
+static void _registry_global_relay(void *data, uint32_t id,
+                                   uint32_t permissions,
+                                   const char *type, uint32_t version,
+                                   const struct spa_dict *props)
 {
-    g_global_cb = global_cb;
-    g_global_remove_cb = global_remove_cb;
-    g_user_data = user_data;
+    struct pw_bridge_registry_listener *l = data;
+    if (l->global_cb == NULL)
+        return;
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    l->global_cb(l->user_data, id, permissions, type, version, props);
+    PyGILState_Release(gil);
 }
 
-int pw_bridge_registry_add_listener(
-    struct pw_registry *registry,
-    struct spa_hook *hook)
+static void _registry_global_remove_relay(void *data, uint32_t id)
 {
-    return pw_registry_add_listener(
-        registry, hook, &g_registry_events, NULL);
+    struct pw_bridge_registry_listener *l = data;
+    if (l->global_remove_cb == NULL)
+        return;
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    l->global_remove_cb(l->user_data, id);
+    PyGILState_Release(gil);
+}
+
+static const struct pw_registry_events g_registry_events = {
+    .version       = PW_VERSION_REGISTRY_EVENTS,
+    .global        = _registry_global_relay,
+    .global_remove = _registry_global_remove_relay,
+};
+
+struct pw_bridge_registry_listener *
+pw_bridge_registry_listener_new(struct pw_registry *registry,
+                                pw_bridge_global_cb_t global_cb,
+                                pw_bridge_global_remove_cb_t global_remove_cb,
+                                void *user_data)
+{
+    if (registry == NULL)
+        return NULL;
+
+    struct pw_bridge_registry_listener *l = calloc(1, sizeof(*l));
+    if (l == NULL)
+        return NULL;
+
+    l->global_cb        = global_cb;
+    l->global_remove_cb = global_remove_cb;
+    l->user_data        = user_data;
+
+    pw_registry_add_listener(registry, &l->hook, &g_registry_events, l);
+    return l;
+}
+
+void pw_bridge_registry_listener_free(struct pw_bridge_registry_listener *l)
+{
+    if (l == NULL)
+        return;
+    spa_hook_remove(&l->hook);
+    free(l);
 }
 
 
 /* ====================================================================
- * Core: listeners (diagnostic + disconnection detection)
+ * Core listener: per-instance callbacks and user_data
  * ==================================================================== */
+
+typedef void (*pw_bridge_core_info_cb_t)(
+    void *user_data,
+    const char *name,
+    const char *version,
+    uint32_t change_mask);
+
+typedef void (*pw_bridge_core_done_cb_t)(
+    void *user_data,
+    uint32_t id,
+    int seq);
 
 typedef void (*pw_bridge_core_error_cb_t)(
     void *user_data,
@@ -101,114 +177,345 @@ typedef void (*pw_bridge_core_error_cb_t)(
     int res,
     const char *message);
 
-static pw_bridge_core_error_cb_t g_core_error_cb = NULL;
-static void                     *g_core_error_user_data = NULL;
+struct pw_bridge_core_listener {
+    struct spa_hook            hook;
+    pw_bridge_core_info_cb_t   info_cb;
+    pw_bridge_core_done_cb_t   done_cb;
+    pw_bridge_core_error_cb_t  error_cb;
+    void                      *user_data;
+};
 
-static void _core_info_cb(void *data, const struct pw_core_info *info)
+static void _core_info_relay(void *data, const struct pw_core_info *info)
 {
-    fprintf(stderr, "[C] core info: name=%s version=%s\n",
-            info->name ? info->name : "(null)",
-            info->version ? info->version : "(null)");
-    (void)data;
+    struct pw_bridge_core_listener *l = data;
+    if (l->info_cb == NULL)
+        return;
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    l->info_cb(l->user_data,
+               info->name ? info->name : "",
+               info->version ? info->version : "",
+               info->change_mask);
+    PyGILState_Release(gil);
 }
 
-static void _core_done_cb(void *data, uint32_t id, int seq)
+static void _core_done_relay(void *data, uint32_t id, int seq)
 {
-    fprintf(stderr, "[C] core done: id=%u seq=%d\n", id, seq);
-    (void)data;
+    struct pw_bridge_core_listener *l = data;
+    if (l->done_cb == NULL)
+        return;
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    l->done_cb(l->user_data, id, seq);
+    PyGILState_Release(gil);
 }
 
 static void _core_error_relay(void *data, uint32_t id, int seq,
                               int res, const char *message)
 {
-    fprintf(stderr, "[C] core error: id=%u seq=%d res=%d msg=%s\n",
-            id, seq, res, message ? message : "(null)");
+    struct pw_bridge_core_listener *l = data;
+    if (l->error_cb == NULL)
+        return;
 
-    if (g_core_error_cb != NULL)
-        g_core_error_cb(g_core_error_user_data, id, seq, res, message);
-    (void)data;
+    PyGILState_STATE gil = PyGILState_Ensure();
+    l->error_cb(l->user_data, id, seq, res, message);
+    PyGILState_Release(gil);
 }
 
 static const struct pw_core_events g_core_events = {
     .version = PW_VERSION_CORE_EVENTS,
-    .info = _core_info_cb,
-    .done = _core_done_cb,
-    .error = _core_error_relay,
+    .info    = _core_info_relay,
+    .done    = _core_done_relay,
+    .error   = _core_error_relay,
 };
 
-static struct spa_hook g_core_hook;
-
-void pw_bridge_set_core_error_callback(
-    pw_bridge_core_error_cb_t cb, void *user_data)
+struct pw_bridge_core_listener *
+pw_bridge_core_listener_new(struct pw_core *core,
+                            pw_bridge_core_info_cb_t info_cb,
+                            pw_bridge_core_done_cb_t done_cb,
+                            pw_bridge_core_error_cb_t error_cb,
+                            void *user_data)
 {
-    g_core_error_cb = cb;
-    g_core_error_user_data = user_data;
+    if (core == NULL)
+        return NULL;
+
+    struct pw_bridge_core_listener *l = calloc(1, sizeof(*l));
+    if (l == NULL)
+        return NULL;
+
+    l->info_cb   = info_cb;
+    l->done_cb   = done_cb;
+    l->error_cb  = error_cb;
+    l->user_data = user_data;
+
+    pw_core_add_listener(core, &l->hook, &g_core_events, l);
+    return l;
 }
 
-void pw_bridge_add_core_listener(struct pw_core *core)
+void pw_bridge_core_listener_free(struct pw_bridge_core_listener *l)
 {
-    pw_core_add_listener(core, &g_core_hook, &g_core_events, NULL);
+    if (l == NULL)
+        return;
+    spa_hook_remove(&l->hook);
+    free(l);
 }
 
 
 /* ====================================================================
- * Binding on a node and reading its complete properties
+ * Node proxy: bind + listener
  * ==================================================================== */
 
 typedef void (*pw_bridge_node_info_cb_t)(
     void *user_data,
     uint32_t node_id,
+    uint32_t max_input_ports,
+    uint32_t max_output_ports,
+    uint32_t change_mask,
+    int      state,
+    const char *error,
     const struct spa_dict *props);
 
-static pw_bridge_node_info_cb_t g_node_info_cb = NULL;
-static void                    *g_node_info_user_data = NULL;
+struct pw_bridge_node_listener {
+    struct spa_hook            hook;
+    pw_bridge_node_info_cb_t   cb;
+    void                      *user_data;
+};
 
-static void _node_info_relay(void *data,
-                             const struct pw_node_info *info)
+static void _node_info_relay(void *data, const struct pw_node_info *info)
 {
-    if (g_node_info_cb != NULL)
-        g_node_info_cb(g_node_info_user_data, info->id, info->props);
-    (void)data;
+    struct pw_bridge_node_listener *l = data;
+    if (l->cb == NULL)
+        return;
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    l->cb(l->user_data,
+          info->id,
+          info->max_input_ports,
+          info->max_output_ports,
+          info->change_mask,
+          info->state,
+          info->error ? info->error : "",
+          info->props);
+    PyGILState_Release(gil);
 }
 
 static const struct pw_node_events g_node_events = {
     .version = PW_VERSION_NODE_EVENTS,
-    .info = _node_info_relay,
+    .info    = _node_info_relay,
 };
-
-void pw_bridge_set_node_info_callback(pw_bridge_node_info_cb_t cb,
-                                      void *user_data)
-{
-    g_node_info_cb = cb;
-    g_node_info_user_data = user_data;
-}
 
 struct pw_proxy *pw_bridge_bind_node(struct pw_registry *registry,
                                      uint32_t node_id)
 {
+    if (registry == NULL)
+        return NULL;
     return (struct pw_proxy *)pw_registry_bind(
         registry, node_id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
 }
 
-struct spa_hook *pw_bridge_node_add_listener(struct pw_proxy *proxy)
+struct pw_bridge_node_listener *
+pw_bridge_node_listener_new(struct pw_proxy *proxy,
+                            pw_bridge_node_info_cb_t cb,
+                            void *user_data)
 {
-    struct spa_hook *hook = calloc(1, sizeof(struct spa_hook));
-    if (hook == NULL)
+    if (proxy == NULL)
         return NULL;
-    pw_node_add_listener((struct pw_node *)proxy, hook,
-                         &g_node_events, NULL);
-    return hook;
+
+    struct pw_bridge_node_listener *l = calloc(1, sizeof(*l));
+    if (l == NULL)
+        return NULL;
+
+    l->cb        = cb;
+    l->user_data = user_data;
+
+    pw_node_add_listener((struct pw_node *)proxy, &l->hook,
+                         &g_node_events, l);
+    return l;
+}
+
+void pw_bridge_node_listener_free(struct pw_bridge_node_listener *l)
+{
+    if (l == NULL)
+        return;
+    spa_hook_remove(&l->hook);
+    free(l);
 }
 
 
 /* ====================================================================
- * Link creation
+ * Port proxy: bind + listener
  * ==================================================================== */
 
+typedef void (*pw_bridge_port_info_cb_t)(
+    void *user_data,
+    uint32_t port_id,
+    uint32_t direction,
+    uint32_t change_mask,
+    const struct spa_dict *props);
+
+struct pw_bridge_port_listener {
+    struct spa_hook            hook;
+    pw_bridge_port_info_cb_t   cb;
+    void                      *user_data;
+};
+
+static void _port_info_relay(void *data, const struct pw_port_info *info)
+{
+    struct pw_bridge_port_listener *l = data;
+    if (l->cb == NULL)
+        return;
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    l->cb(l->user_data,
+          info->id,
+          info->direction,
+          info->change_mask,
+          info->props);
+    PyGILState_Release(gil);
+}
+
+static const struct pw_port_events g_port_events = {
+    .version = PW_VERSION_PORT_EVENTS,
+    .info    = _port_info_relay,
+};
+
+struct pw_proxy *pw_bridge_bind_port(struct pw_registry *registry,
+                                     uint32_t port_id)
+{
+    if (registry == NULL)
+        return NULL;
+    return (struct pw_proxy *)pw_registry_bind(
+        registry, port_id, PW_TYPE_INTERFACE_Port, PW_VERSION_PORT, 0);
+}
+
+struct pw_bridge_port_listener *
+pw_bridge_port_listener_new(struct pw_proxy *proxy,
+                            pw_bridge_port_info_cb_t cb,
+                            void *user_data)
+{
+    if (proxy == NULL)
+        return NULL;
+
+    struct pw_bridge_port_listener *l = calloc(1, sizeof(*l));
+    if (l == NULL)
+        return NULL;
+
+    l->cb        = cb;
+    l->user_data = user_data;
+
+    pw_port_add_listener((struct pw_port *)proxy, &l->hook,
+                         &g_port_events, l);
+    return l;
+}
+
+void pw_bridge_port_listener_free(struct pw_bridge_port_listener *l)
+{
+    if (l == NULL)
+        return;
+    spa_hook_remove(&l->hook);
+    free(l);
+}
+
+
+/* ====================================================================
+ * Link proxy: bind + listener + creation
+ * ==================================================================== */
+
+typedef void (*pw_bridge_link_info_cb_t)(
+    void *user_data,
+    uint32_t link_id,
+    uint32_t output_node_id,
+    uint32_t output_port_id,
+    uint32_t input_node_id,
+    uint32_t input_port_id,
+    int      state,
+    const char *error,
+    const struct spa_dict *props);
+
+struct pw_bridge_link_listener {
+    struct spa_hook            hook;
+    pw_bridge_link_info_cb_t   cb;
+    void                      *user_data;
+};
+
+static void _link_info_relay(void *data, const struct pw_link_info *info)
+{
+    struct pw_bridge_link_listener *l = data;
+    if (l->cb == NULL)
+        return;
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    l->cb(l->user_data,
+          info->id,
+          info->output_node_id,
+          info->output_port_id,
+          info->input_node_id,
+          info->input_port_id,
+          info->state,
+          info->error ? info->error : "",
+          info->props);
+    PyGILState_Release(gil);
+}
+
+static const struct pw_link_events g_link_events = {
+    .version = PW_VERSION_LINK_EVENTS,
+    .info    = _link_info_relay,
+};
+
+struct pw_proxy *pw_bridge_bind_link(struct pw_registry *registry,
+                                     uint32_t link_id)
+{
+    if (registry == NULL)
+        return NULL;
+    return (struct pw_proxy *)pw_registry_bind(
+        registry, link_id, PW_TYPE_INTERFACE_Link, PW_VERSION_LINK, 0);
+}
+
+struct pw_bridge_link_listener *
+pw_bridge_link_listener_new(struct pw_proxy *proxy,
+                            pw_bridge_link_info_cb_t cb,
+                            void *user_data)
+{
+    if (proxy == NULL)
+        return NULL;
+
+    struct pw_bridge_link_listener *l = calloc(1, sizeof(*l));
+    if (l == NULL)
+        return NULL;
+
+    l->cb        = cb;
+    l->user_data = user_data;
+
+    pw_link_add_listener((struct pw_link *)proxy, &l->hook,
+                         &g_link_events, l);
+    return l;
+}
+
+void pw_bridge_link_listener_free(struct pw_bridge_link_listener *l)
+{
+    if (l == NULL)
+        return;
+    spa_hook_remove(&l->hook);
+    free(l);
+}
+
+/* Link creation.
+ *
+ * The caller is expected to hold the thread loop lock (via
+ * pw_bridge_thread_loop_lock) while calling this function. It is
+ * safe to call from any thread provided the lock is held, which
+ * is exactly what pw_thread_loop_lock guarantees.
+ *
+ * The returned proxy must be bound to a listener if the caller
+ * wants link.info / link.error events.
+ */
 struct pw_proxy *pw_bridge_create_link(struct pw_core *core,
                                        uint32_t out_port_id,
                                        uint32_t in_port_id)
 {
+    if (core == NULL)
+        return NULL;
+
     char out_buf[16];
     char in_buf[16];
     struct spa_dict_item items[2];
@@ -217,53 +524,56 @@ struct pw_proxy *pw_bridge_create_link(struct pw_core *core,
     snprintf(out_buf, sizeof(out_buf), "%u", out_port_id);
     snprintf(in_buf, sizeof(in_buf), "%u", in_port_id);
 
-    items[0].key = "link.output.port";
+    items[0].key   = "link.output.port";
     items[0].value = out_buf;
-    items[1].key = "link.input.port";
+    items[1].key   = "link.input.port";
     items[1].value = in_buf;
 
-    props.flags = 0;
+    props.flags   = 0;
     props.n_items = 2;
-    props.items = items;
+    props.items   = items;
 
-    return pw_core_create_object(
-        core,
-        "link-factory",
-        PW_TYPE_INTERFACE_Link,
-        PW_VERSION_LINK,
-        &props,
-        0);
+    return pw_core_create_object(core,
+                                 "link-factory",
+                                 PW_TYPE_INTERFACE_Link,
+                                 PW_VERSION_LINK,
+                                 &props,
+                                 0);
 }
 
 
 /* ====================================================================
- * Link destruction
+ * Client proxy: bind + update properties
  * ==================================================================== */
 
-int pw_bridge_destroy_link(struct pw_registry *registry, uint32_t link_id)
+struct pw_proxy *pw_bridge_bind_client(struct pw_registry *registry,
+                                       uint32_t client_id)
 {
-    return pw_registry_destroy(registry, link_id);
+    if (registry == NULL)
+        return NULL;
+    return (struct pw_proxy *)pw_registry_bind(
+        registry, client_id, PW_TYPE_INTERFACE_Client, PW_VERSION_CLIENT, 0);
+}
+
+int pw_bridge_client_update_properties(struct pw_proxy *proxy,
+                                       const struct spa_dict *props)
+{
+    if (proxy == NULL)
+        return -1;
+    pw_client_update_properties((struct pw_client *)proxy, props);
+    return 0;
 }
 
 
 /* ====================================================================
- * Proxy destruction
+ * Core sync
  * ==================================================================== */
 
-void pw_bridge_destroy_proxy(struct pw_proxy *proxy)
+int pw_bridge_core_sync(struct pw_core *core, uint32_t id, int seq)
 {
-    if (proxy != NULL)
-        pw_proxy_destroy(proxy);
-}
-
-
-/* ====================================================================
- * Library version (debug)
- * ==================================================================== */
-
-const char *pw_bridge_version(void)
-{
-    return pw_get_library_version();
+    if (core == NULL)
+        return -1;
+    return pw_core_sync(core, id, seq);
 }
 
 
@@ -273,10 +583,12 @@ const char *pw_bridge_version(void)
 
 void pw_bridge_thread_loop_lock(void *thread_loop)
 {
-    pw_thread_loop_lock((struct pw_thread_loop *)thread_loop);
+    if (thread_loop != NULL)
+        pw_thread_loop_lock((struct pw_thread_loop *)thread_loop);
 }
 
 void pw_bridge_thread_loop_unlock(void *thread_loop)
 {
-    pw_thread_loop_unlock((struct pw_thread_loop *)thread_loop);
+    if (thread_loop != NULL)
+        pw_thread_loop_unlock((struct pw_thread_loop *)thread_loop);
 }
