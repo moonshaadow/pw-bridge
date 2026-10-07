@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.so
 *.o
+*.swp
 *.egg-info/
 build/
 dist/
