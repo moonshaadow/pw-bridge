@@ -4,8 +4,8 @@ Uses pw_thread_loop to ensure that all PipeWire API calls are
 made from the loop's thread.
 
 This module also handles:
-- binding proxies on nodes, ports, links and every Metadata object
-  announced by the registry
+- binding proxies on nodes, ports, links, devices and every
+  Metadata object announced by the registry
 - detection of core loss (PipeWire restart) via the `core error`
   and `global_remove(id=0)` events
 - automatic reconnection.
@@ -51,6 +51,7 @@ class PipeWireRegistry:
             on_node_info: Optional[Callable[[int, dict], None]] = None,
             on_port_info: Optional[Callable[[int, dict], None]] = None,
             on_link_info: Optional[Callable[[int, dict], None]] = None,
+            on_device_info: Optional[Callable[[int, dict], None]] = None,
             on_metadata_changed: Optional[
                 Callable[[int, int, str, str, Optional[str]], None]] = None,
             on_core_lost: Optional[Callable[[], None]] = None,
@@ -61,6 +62,7 @@ class PipeWireRegistry:
         self._on_node_info = on_node_info
         self._on_port_info = on_port_info
         self._on_link_info = on_link_info
+        self._on_device_info = on_device_info
         self._on_metadata_changed = on_metadata_changed
         self._on_core_lost = on_core_lost
         self._on_core_restored = on_core_restored
@@ -91,6 +93,8 @@ class PipeWireRegistry:
         self._node_info_cb_c = pw.PW_BRIDGE_NODE_INFO_CB(self._node_info_cb)
         self._port_info_cb_c = pw.PW_BRIDGE_PORT_INFO_CB(self._port_info_cb)
         self._link_info_cb_c = pw.PW_BRIDGE_LINK_INFO_CB(self._link_info_cb)
+        self._device_info_cb_c = pw.PW_BRIDGE_DEVICE_INFO_CB(
+            self._device_info_cb)
 
         if pw.HAVE_METADATA:
             self._metadata_cb_c = pw.PW_BRIDGE_METADATA_PROPERTY_CB(
@@ -110,6 +114,8 @@ class PipeWireRegistry:
         self._port_proxies: dict[int, object] = {}
         self._link_listeners: dict[int, int] = {}
         self._link_proxies: dict[int, object] = {}
+        self._device_listeners: dict[int, int] = {}
+        self._device_proxies: dict[int, object] = {}
 
         # Metadata snapshot, indexed by Metadata object first:
         #   self.metadata[metadata_id][subject][key] = (type_spa, raw)
@@ -183,8 +189,9 @@ class PipeWireRegistry:
             _logger.error("Failed to retrieve the registry")
             return False
 
-        # Registry listener (per instance). Metadata objects are
-        # discovered through registry global_added events.
+        # Registry listener (per instance). Nodes, ports, links,
+        # devices and Metadata objects are all discovered through
+        # registry global_added events.
         self._registry_listener = (
             pw._lib_wrapper.pw_bridge_registry_listener_new(
                 self._registry,
@@ -256,6 +263,8 @@ class PipeWireRegistry:
                     self._unbind_port_locked(port_id)
                 for link_id in list(self._link_listeners.keys()):
                     self._unbind_link_locked(link_id)
+                for device_id in list(self._device_listeners.keys()):
+                    self._unbind_device_locked(device_id)
                 for metadata_id in list(self._metadata_listeners.keys()):
                     self._unbind_metadata_locked(metadata_id)
                 for proxy, listener in self._pending_link_proxies:
@@ -340,6 +349,8 @@ class PipeWireRegistry:
             self._port_proxies.clear()
             self._link_listeners.clear()
             self._link_proxies.clear()
+            self._device_listeners.clear()
+            self._device_proxies.clear()
             self._pending_link_proxies.clear()
             self._metadata_proxies.clear()
             self._metadata_listeners.clear()
@@ -366,6 +377,8 @@ class PipeWireRegistry:
                     self._port_proxies.clear()
                     self._link_listeners.clear()
                     self._link_proxies.clear()
+                    self._device_listeners.clear()
+                    self._device_proxies.clear()
                     self._pending_link_proxies.clear()
                     self._metadata_proxies.clear()
                     self._metadata_listeners.clear()
@@ -404,6 +417,8 @@ class PipeWireRegistry:
             self._bind_port(id_)
         elif type_str == pw.PW_TYPE_INTERFACE_Link:
             self._bind_link(id_)
+        elif type_str == pw.PW_TYPE_INTERFACE_Device:
+            self._bind_device(id_)
         elif (type_str == pw.PW_TYPE_INTERFACE_Metadata
                 and self._thread_loop is not None):
             pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
@@ -424,6 +439,7 @@ class PipeWireRegistry:
             self._unbind_node_locked(id_)
             self._unbind_port_locked(id_)
             self._unbind_link_locked(id_)
+            self._unbind_device_locked(id_)
             self._unbind_metadata_locked(id_)
 
         if id_ == pw.PW_ID_CORE:
@@ -469,6 +485,8 @@ class PipeWireRegistry:
                     self._port_proxies.clear()
                     self._link_listeners.clear()
                     self._link_proxies.clear()
+                    self._device_listeners.clear()
+                    self._device_proxies.clear()
                     self._pending_link_proxies.clear()
                     self._metadata_proxies.clear()
                     self._metadata_listeners.clear()
@@ -561,6 +579,27 @@ class PipeWireRegistry:
             except Exception:
                 _logger.exception("Error in on_link_info")
 
+    def _device_info_cb(self, user_data, device_id, change_mask,
+                        props: ctypes.POINTER(pw.spa_dict)):
+        if not props:
+            return
+        props_dict = props.contents.to_dict()
+        props_dict["_change_mask"] = change_mask
+
+        with self._objects_lock:
+            existing = self.objects.get(device_id)
+            if existing is not None:
+                type_str, base_props = existing
+                merged = dict(base_props)
+                merged.update(props_dict)
+                self.objects[device_id] = (type_str, merged)
+
+        if self._on_device_info is not None:
+            try:
+                self._on_device_info(device_id, props_dict)
+            except Exception:
+                _logger.exception("Error in on_device_info")
+
     def _metadata_property_cb(self, user_data, metadata_id, subject,
                               key, type_, value):
         """Called for each metadata entry at subscribe time, and on
@@ -568,8 +607,7 @@ class PipeWireRegistry:
         being removed.
 
         Returns 0 (accept) as required by the PipeWire metadata
-        callback contract. Failing to return an int would make ctypes
-        raise "NoneType cannot be interpreted as an integer".
+        callback contract.
         """
         key_s = key.decode() if key else ""
         type_s = type_.decode() if type_ else ""
@@ -595,7 +633,7 @@ class PipeWireRegistry:
         return 0
 
     # ------------------------------------------------------------------
-    # Binding proxies (node / port / link)
+    # Binding proxies (node / port / link / device)
     # ------------------------------------------------------------------
 
     def _bind_node(self, node_id: int):
@@ -652,6 +690,24 @@ class PipeWireRegistry:
             self._link_proxies[link_id] = proxy
             self._link_listeners[link_id] = listener
 
+    def _bind_device(self, device_id: int):
+        if self._registry is None:
+            return
+        with self._objects_lock:
+            if device_id in self._device_proxies:
+                return
+            proxy = pw._lib_wrapper.pw_bridge_bind_device(
+                self._registry, device_id)
+            if not proxy:
+                return
+            listener = pw._lib_wrapper.pw_bridge_device_listener_new(
+                proxy, self._device_info_cb_c, None)
+            if not listener:
+                pw.proxy_destroy(proxy)
+                return
+            self._device_proxies[device_id] = proxy
+            self._device_listeners[device_id] = listener
+
     def _unbind_node_locked(self, node_id: int):
         listener = self._node_listeners.pop(node_id, None)
         if listener:
@@ -676,6 +732,14 @@ class PipeWireRegistry:
         if proxy:
             pw.proxy_destroy(proxy)
 
+    def _unbind_device_locked(self, device_id: int):
+        listener = self._device_listeners.pop(device_id, None)
+        if listener:
+            pw._lib_wrapper.pw_bridge_device_listener_free(listener)
+        proxy = self._device_proxies.pop(device_id, None)
+        if proxy:
+            pw.proxy_destroy(proxy)
+
     # ------------------------------------------------------------------
     # Metadata accessors
     # ------------------------------------------------------------------
@@ -684,8 +748,6 @@ class PipeWireRegistry:
         """Return (type_spa, raw_value) for (subject, key), or None.
 
         Walks all bound Metadata objects and returns the first match.
-        The order is deterministic but not meaningful: any Metadata
-        object holding the key is considered authoritative.
         Returns None if the metadata interface is unavailable.
         """
         if not pw.HAVE_METADATA:

@@ -571,6 +571,80 @@ int pw_bridge_client_update_properties(struct pw_proxy *proxy,
 
 
 /* ====================================================================
+ * Device proxy: bind + listener
+ * ==================================================================== */
+
+typedef void (*pw_bridge_device_info_cb_t)(
+    void *user_data,
+    uint32_t device_id,
+    uint32_t change_mask,
+    const struct spa_dict *props);
+
+struct pw_bridge_device_listener {
+    struct spa_hook             hook;
+    pw_bridge_device_info_cb_t  cb;
+    void                       *user_data;
+};
+
+static void _device_info_relay(void *data, const struct pw_device_info *info)
+{
+    struct pw_bridge_device_listener *l = data;
+    if (l->cb == NULL)
+        return;
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    l->cb(l->user_data,
+          info->id,
+          info->change_mask,
+          info->props);
+    PyGILState_Release(gil);
+}
+
+static const struct pw_device_events g_device_events = {
+    .version = PW_VERSION_DEVICE_EVENTS,
+    .info    = _device_info_relay,
+};
+
+struct pw_proxy *pw_bridge_bind_device(struct pw_registry *registry,
+                                       uint32_t device_id)
+{
+    if (registry == NULL)
+        return NULL;
+    return (struct pw_proxy *)pw_registry_bind(
+        registry, device_id,
+        PW_TYPE_INTERFACE_Device, PW_VERSION_DEVICE, 0);
+}
+
+struct pw_bridge_device_listener *
+pw_bridge_device_listener_new(struct pw_proxy *proxy,
+                              pw_bridge_device_info_cb_t cb,
+                              void *user_data)
+{
+    if (proxy == NULL)
+        return NULL;
+
+    struct pw_bridge_device_listener *l = calloc(1, sizeof(*l));
+    if (l == NULL)
+        return NULL;
+
+    l->cb        = cb;
+    l->user_data = user_data;
+
+    pw_device_add_listener((struct pw_device *)proxy, &l->hook,
+                           &g_device_events, l);
+    return l;
+}
+
+void pw_bridge_device_listener_free(struct pw_bridge_device_listener *l)
+{
+    if (l == NULL)
+        return;
+    spa_hook_remove(&l->hook);
+    free(l);
+}
+
+
+/* ====================================================================
  * Metadata proxy: bind + listener + set_property
  *
  * Available in PipeWire >= 1.2. On older versions, PW_VERSION_METADATA
@@ -579,8 +653,7 @@ int pw_bridge_client_update_properties(struct pw_proxy *proxy,
  *
  * The metadata_id of the bound object is stored in the listener
  * struct and passed to the Python callback, so the caller can
- * distinguish several Metadata objects (there are typically three:
- * 'default', 'settings', 'route-settings').
+ * distinguish several Metadata objects.
  * ==================================================================== */
 
 #ifdef PW_TYPE_INTERFACE_Metadata

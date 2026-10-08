@@ -100,6 +100,10 @@ PW_LINK_STATE_NEGOTIATING  = 2
 PW_LINK_STATE_PAUSED       = 3
 PW_LINK_STATE_ACTIVE       = 4
 
+# Device change mask bits (enum pw_device_change_mask)
+PW_DEVICE_CHANGE_MASK_PROPS  = 1 << 0
+PW_DEVICE_CHANGE_MASK_PARAMS = 1 << 1
+
 # Interface type strings
 PW_TYPE_INTERFACE_Node     = "PipeWire:Interface:Node"
 PW_TYPE_INTERFACE_Port     = "PipeWire:Interface:Port"
@@ -259,15 +263,22 @@ PW_BRIDGE_LINK_INFO_CB = ctypes.CFUNCTYPE(
     ctypes.POINTER(spa_dict),
 )
 
-# Metadata callback: (user_data, metadata_id, subject, key, type, value)
+PW_BRIDGE_DEVICE_INFO_CB = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_void_p,   # user_data
+    ctypes.c_uint32,   # device_id
+    ctypes.c_uint32,   # change_mask
+    ctypes.POINTER(spa_dict),
+)
+
 PW_BRIDGE_METADATA_PROPERTY_CB = ctypes.CFUNCTYPE(
     ctypes.c_int,
-    ctypes.c_void_p,   # user_data
-    ctypes.c_uint32,   # metadata_id
-    ctypes.c_uint32,   # subject
-    ctypes.c_char_p,   # key
-    ctypes.c_char_p,   # type
-    ctypes.c_char_p,   # value (may be None)
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
 )
 
 
@@ -522,6 +533,25 @@ _lib_wrapper.pw_bridge_client_update_properties.argtypes = [
 _lib_wrapper.pw_bridge_client_update_properties.restype = ctypes.c_int
 
 
+# --- C wrapper: device ------------------------------------------------------
+
+_lib_wrapper.pw_bridge_bind_device.argtypes = [
+    ctypes.POINTER(pw_registry),
+    ctypes.c_uint32,
+]
+_lib_wrapper.pw_bridge_bind_device.restype = ctypes.POINTER(pw_proxy)
+
+_lib_wrapper.pw_bridge_device_listener_new.argtypes = [
+    ctypes.POINTER(pw_proxy),
+    PW_BRIDGE_DEVICE_INFO_CB,
+    ctypes.c_void_p,
+]
+_lib_wrapper.pw_bridge_device_listener_new.restype = ctypes.c_void_p
+
+_lib_wrapper.pw_bridge_device_listener_free.argtypes = [ctypes.c_void_p]
+_lib_wrapper.pw_bridge_device_listener_free.restype = None
+
+
 # --- C wrapper: metadata (optional, PipeWire >= 1.2) ------------------------
 
 HAVE_METADATA = False
@@ -541,7 +571,7 @@ try:
         ctypes.POINTER(pw_proxy),
         PW_BRIDGE_METADATA_PROPERTY_CB,
         ctypes.c_void_p,
-        ctypes.c_uint32,   # metadata_id
+        ctypes.c_uint32,
     ]
     _lib_wrapper.pw_bridge_metadata_listener_new.restype = ctypes.c_void_p
 
