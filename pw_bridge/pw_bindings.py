@@ -9,6 +9,9 @@ Rule:
     directly through `_lib`;
   - otherwise, it must be exposed by the C wrapper and called
     through `_lib_wrapper`.
+
+Optional interfaces (metadata) are exposed conditionally. Check the
+module-level HAVE_METADATA flag before using them.
 """
 
 import ctypes
@@ -105,6 +108,9 @@ PW_TYPE_INTERFACE_Client   = "PipeWire:Interface:Client"
 PW_TYPE_INTERFACE_Device   = "PipeWire:Interface:Device"
 PW_TYPE_INTERFACE_Metadata = "PipeWire:Interface:Metadata"
 
+# SPA metadata types
+SPA_TYPE_STRING_JSON = "Spa:String:JSON"
+
 
 # --- SPA structures ---------------------------------------------------------
 
@@ -155,7 +161,6 @@ class spa_dict(ctypes.Structure):
                 try:
                     result[item.key.decode()] = item.value.decode()
                 except UnicodeDecodeError:
-                    # Skip non-UTF8 values rather than crash.
                     continue
         return result
 
@@ -199,9 +204,9 @@ PW_BRIDGE_GLOBAL_REMOVE_CB = ctypes.CFUNCTYPE(
 PW_BRIDGE_CORE_INFO_CB = ctypes.CFUNCTYPE(
     None,
     ctypes.c_void_p,
-    ctypes.c_char_p,   # name
-    ctypes.c_char_p,   # version
-    ctypes.c_uint32,   # change_mask
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_uint32,
 )
 
 PW_BRIDGE_CORE_DONE_CB = ctypes.CFUNCTYPE(
@@ -214,44 +219,55 @@ PW_BRIDGE_CORE_DONE_CB = ctypes.CFUNCTYPE(
 PW_BRIDGE_CORE_ERROR_CB = ctypes.CFUNCTYPE(
     None,
     ctypes.c_void_p,
-    ctypes.c_uint32,   # id
-    ctypes.c_int,      # seq
-    ctypes.c_int,      # res
-    ctypes.c_char_p,   # message
+    ctypes.c_uint32,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_char_p,
 )
 
 PW_BRIDGE_NODE_INFO_CB = ctypes.CFUNCTYPE(
     None,
-    ctypes.c_void_p,   # user_data
-    ctypes.c_uint32,   # node_id
-    ctypes.c_uint32,   # max_input_ports
-    ctypes.c_uint32,   # max_output_ports
-    ctypes.c_uint32,   # change_mask
-    ctypes.c_int,      # state
-    ctypes.c_char_p,   # error
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_int,
+    ctypes.c_char_p,
     ctypes.POINTER(spa_dict),
 )
 
 PW_BRIDGE_PORT_INFO_CB = ctypes.CFUNCTYPE(
     None,
     ctypes.c_void_p,
-    ctypes.c_uint32,   # port_id
-    ctypes.c_uint32,   # direction
-    ctypes.c_uint32,   # change_mask
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
     ctypes.POINTER(spa_dict),
 )
 
 PW_BRIDGE_LINK_INFO_CB = ctypes.CFUNCTYPE(
     None,
     ctypes.c_void_p,
-    ctypes.c_uint32,   # link_id
-    ctypes.c_uint32,   # output_node_id
-    ctypes.c_uint32,   # output_port_id
-    ctypes.c_uint32,   # input_node_id
-    ctypes.c_uint32,   # input_port_id
-    ctypes.c_int,      # state
-    ctypes.c_char_p,   # error
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_int,
+    ctypes.c_char_p,
     ctypes.POINTER(spa_dict),
+)
+
+# Metadata callback: (user_data, metadata_id, subject, key, type, value)
+PW_BRIDGE_METADATA_PROPERTY_CB = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,   # user_data
+    ctypes.c_uint32,   # metadata_id
+    ctypes.c_uint32,   # subject
+    ctypes.c_char_p,   # key
+    ctypes.c_char_p,   # type
+    ctypes.c_char_p,   # value (may be None)
 )
 
 
@@ -504,6 +520,48 @@ _lib_wrapper.pw_bridge_client_update_properties.argtypes = [
     ctypes.POINTER(spa_dict),
 ]
 _lib_wrapper.pw_bridge_client_update_properties.restype = ctypes.c_int
+
+
+# --- C wrapper: metadata (optional, PipeWire >= 1.2) ------------------------
+
+HAVE_METADATA = False
+PW_VERSION_METADATA = 0
+
+try:
+    _lib_wrapper.pw_bridge_version_metadata.argtypes = []
+    _lib_wrapper.pw_bridge_version_metadata.restype = ctypes.c_uint32
+
+    _lib_wrapper.pw_bridge_bind_metadata.argtypes = [
+        ctypes.POINTER(pw_registry),
+        ctypes.c_uint32,
+    ]
+    _lib_wrapper.pw_bridge_bind_metadata.restype = ctypes.POINTER(pw_proxy)
+
+    _lib_wrapper.pw_bridge_metadata_listener_new.argtypes = [
+        ctypes.POINTER(pw_proxy),
+        PW_BRIDGE_METADATA_PROPERTY_CB,
+        ctypes.c_void_p,
+        ctypes.c_uint32,   # metadata_id
+    ]
+    _lib_wrapper.pw_bridge_metadata_listener_new.restype = ctypes.c_void_p
+
+    _lib_wrapper.pw_bridge_metadata_listener_free.argtypes = [ctypes.c_void_p]
+    _lib_wrapper.pw_bridge_metadata_listener_free.restype = None
+
+    _lib_wrapper.pw_bridge_metadata_set_property.argtypes = [
+        ctypes.POINTER(pw_proxy),
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+    ]
+    _lib_wrapper.pw_bridge_metadata_set_property.restype = ctypes.c_int
+
+    PW_VERSION_METADATA = _lib_wrapper.pw_bridge_version_metadata()
+    HAVE_METADATA = True
+except AttributeError:
+    _logger.debug(
+        "Metadata interface not available in this libpipewire version.")
 
 
 # --- C wrapper: thread loop helpers -----------------------------------------

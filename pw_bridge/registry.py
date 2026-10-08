@@ -4,15 +4,34 @@ Uses pw_thread_loop to ensure that all PipeWire API calls are
 made from the loop's thread.
 
 This module also handles:
-- binding proxies on nodes, ports and links to retrieve their
-  complete properties (node.group, node.link-group, factory.name,
-  port.direction, link.output.port, etc.)
+- binding proxies on nodes, ports, links and every Metadata object
+  announced by the registry
 - detection of core loss (PipeWire restart) via the `core error`
   and `global_remove(id=0)` events
 - automatic reconnection.
+
+The metadata interface is optional. It requires PipeWire >= 1.2.
+When it is not available (see pw_bindings.HAVE_METADATA), the
+metadata-related methods are no-ops and on_metadata_changed is never
+called.
+
+Metadata layout:
+
+    self.metadata[metadata_id][subject][key] = (type_spa, raw_value)
+
+PipeWire typically exposes several Metadata objects at once
+('default', 'settings', 'route-settings'...). We bind them all and
+keep them separate. A Metadata object that emits a removal event
+(value=None) only affects its own bucket, so a key published by
+another Metadata object is not clobbered.
+
+The accessors (get_metadata / get_metadata_json) walk all Metadata
+objects and return the first match. Writes are sent to every bound
+Metadata; PipeWire silently ignores keys an object does not know.
 """
 
 import ctypes
+import json
 import logging
 import threading
 from typing import Callable, Optional
@@ -32,6 +51,8 @@ class PipeWireRegistry:
             on_node_info: Optional[Callable[[int, dict], None]] = None,
             on_port_info: Optional[Callable[[int, dict], None]] = None,
             on_link_info: Optional[Callable[[int, dict], None]] = None,
+            on_metadata_changed: Optional[
+                Callable[[int, int, str, str, Optional[str]], None]] = None,
             on_core_lost: Optional[Callable[[], None]] = None,
             on_core_restored: Optional[Callable[[], None]] = None,
             thread_name: str = "pw_bridge"):
@@ -40,6 +61,7 @@ class PipeWireRegistry:
         self._on_node_info = on_node_info
         self._on_port_info = on_port_info
         self._on_link_info = on_link_info
+        self._on_metadata_changed = on_metadata_changed
         self._on_core_lost = on_core_lost
         self._on_core_restored = on_core_restored
         self._thread_name = thread_name
@@ -53,6 +75,11 @@ class PipeWireRegistry:
         self._registry_listener = None
         self._core_listener = None
 
+        # Metadata: one proxy and one listener per Metadata object
+        # announced by the registry.
+        self._metadata_proxies: dict[int, object] = {}
+        self._metadata_listeners: dict[int, object] = {}
+
         # Strong references to the ctypes callbacks. They MUST live as
         # long as the corresponding C listeners.
         self._global_cb_c = pw.PW_BRIDGE_GLOBAL_CB(self._registry_global_cb)
@@ -64,6 +91,12 @@ class PipeWireRegistry:
         self._node_info_cb_c = pw.PW_BRIDGE_NODE_INFO_CB(self._node_info_cb)
         self._port_info_cb_c = pw.PW_BRIDGE_PORT_INFO_CB(self._port_info_cb)
         self._link_info_cb_c = pw.PW_BRIDGE_LINK_INFO_CB(self._link_info_cb)
+
+        if pw.HAVE_METADATA:
+            self._metadata_cb_c = pw.PW_BRIDGE_METADATA_PROPERTY_CB(
+                self._metadata_property_cb)
+        else:
+            self._metadata_cb_c = None
 
         self._running = False
         self._core_lost = False
@@ -77,6 +110,11 @@ class PipeWireRegistry:
         self._port_proxies: dict[int, object] = {}
         self._link_listeners: dict[int, int] = {}
         self._link_proxies: dict[int, object] = {}
+
+        # Metadata snapshot, indexed by Metadata object first:
+        #   self.metadata[metadata_id][subject][key] = (type_spa, raw)
+        # A removal event only pops from its own metadata_id bucket.
+        self.metadata: dict[int, dict[int, dict[str, tuple[str, str]]]] = {}
 
         # Proxies created via create_link, waiting for their link.info
         # event so we can reconcile the real link_id.
@@ -145,7 +183,8 @@ class PipeWireRegistry:
             _logger.error("Failed to retrieve the registry")
             return False
 
-        # Registry listener (per instance).
+        # Registry listener (per instance). Metadata objects are
+        # discovered through registry global_added events.
         self._registry_listener = (
             pw._lib_wrapper.pw_bridge_registry_listener_new(
                 self._registry,
@@ -165,15 +204,46 @@ class PipeWireRegistry:
 
         return True
 
+    def _bind_metadata_locked(self, metadata_id: int):
+        """Bind a Metadata object and attach a listener.
+
+        Must be called with the thread loop lock held, and only when
+        the registry has announced the object. If pw.HAVE_METADATA is
+        False (PipeWire < 1.2), this is a no-op.
+        """
+        if not pw.HAVE_METADATA:
+            return
+        if self._registry is None:
+            return
+        if metadata_id in self._metadata_proxies:
+            return
+
+        proxy = pw._lib_wrapper.pw_bridge_bind_metadata(
+            self._registry, metadata_id)
+        if not proxy:
+            return
+        listener = pw._lib_wrapper.pw_bridge_metadata_listener_new(
+            proxy, self._metadata_cb_c, None, metadata_id)
+        if not listener:
+            pw.proxy_destroy(proxy)
+            return
+        self._metadata_proxies[metadata_id] = proxy
+        self._metadata_listeners[metadata_id] = listener
+
+    def _unbind_metadata_locked(self, metadata_id: int):
+        listener = self._metadata_listeners.pop(metadata_id, None)
+        if listener:
+            pw._lib_wrapper.pw_bridge_metadata_listener_free(listener)
+        proxy = self._metadata_proxies.pop(metadata_id, None)
+        if proxy:
+            pw.proxy_destroy(proxy)
+        self.metadata.pop(metadata_id, None)
+
     def _destroy_connection(self):
         """Cleanly destroy the PipeWire connection.
 
         Every PipeWire operation that touches a proxy, a hook or the
-        core is performed under the thread loop lock. This matches the
-        pattern used by pw-cli and pw-dump: pw_proxy_destroy,
-        pw_registry_destroy and spa_hook_remove are all context
-        sensitive and must not be called from an arbitrary thread
-        without holding the loop lock.
+        core is performed under the thread loop lock.
         """
         if self._thread_loop:
             pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
@@ -186,6 +256,8 @@ class PipeWireRegistry:
                     self._unbind_port_locked(port_id)
                 for link_id in list(self._link_listeners.keys()):
                     self._unbind_link_locked(link_id)
+                for metadata_id in list(self._metadata_listeners.keys()):
+                    self._unbind_metadata_locked(metadata_id)
                 for proxy, listener in self._pending_link_proxies:
                     pw._lib_wrapper.pw_bridge_link_listener_free(listener)
                     pw.proxy_destroy(proxy)
@@ -269,6 +341,9 @@ class PipeWireRegistry:
             self._link_listeners.clear()
             self._link_proxies.clear()
             self._pending_link_proxies.clear()
+            self._metadata_proxies.clear()
+            self._metadata_listeners.clear()
+            self.metadata.clear()
 
         _logger.info("PipeWire registry stopped")
 
@@ -292,6 +367,9 @@ class PipeWireRegistry:
                     self._link_listeners.clear()
                     self._link_proxies.clear()
                     self._pending_link_proxies.clear()
+                    self._metadata_proxies.clear()
+                    self._metadata_listeners.clear()
+                    self.metadata.clear()
 
                 if self._create_connection():
                     _logger.info("Reconnection to PipeWire succeeded")
@@ -305,7 +383,6 @@ class PipeWireRegistry:
                 else:
                     _logger.info("Reconnection failed, retrying in 1 second")
 
-            # Interruptible sleep.
             self._reconnect_stop.wait(timeout=1.0)
 
     # ------------------------------------------------------------------
@@ -327,6 +404,14 @@ class PipeWireRegistry:
             self._bind_port(id_)
         elif type_str == pw.PW_TYPE_INTERFACE_Link:
             self._bind_link(id_)
+        elif (type_str == pw.PW_TYPE_INTERFACE_Metadata
+                and self._thread_loop is not None):
+            pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
+            try:
+                self._bind_metadata_locked(id_)
+            finally:
+                pw._lib_wrapper.pw_bridge_thread_loop_unlock(
+                    self._thread_loop)
 
         try:
             self._on_global_added(id_, type_str, props_dict)
@@ -339,6 +424,7 @@ class PipeWireRegistry:
             self._unbind_node_locked(id_)
             self._unbind_port_locked(id_)
             self._unbind_link_locked(id_)
+            self._unbind_metadata_locked(id_)
 
         if id_ == pw.PW_ID_CORE:
             if not self._core_lost:
@@ -371,7 +457,6 @@ class PipeWireRegistry:
         _logger.warning("Core error: id=%s seq=%s res=%s msg=%s",
                         id_, seq, res, msg_str)
 
-        # EPIPE (-32) on the core itself indicates a lost connection.
         if id_ == pw.PW_ID_CORE and res == -32:
             if not self._core_lost:
                 _logger.warning("Connection loss detected via core error")
@@ -385,6 +470,9 @@ class PipeWireRegistry:
                     self._link_listeners.clear()
                     self._link_proxies.clear()
                     self._pending_link_proxies.clear()
+                    self._metadata_proxies.clear()
+                    self._metadata_listeners.clear()
+                    self.metadata.clear()
 
                 if self._on_core_lost is not None:
                     try:
@@ -453,10 +541,6 @@ class PipeWireRegistry:
         props_dict["_state"] = state
         props_dict["_error"] = error.decode() if error else ""
 
-        # Reconcile a pending proxy created via create_link().
-        # The proxy was bound before the link_id existed; now that
-        # link.info has fired, we can associate them and register
-        # the pair in the regular tables.
         with self._objects_lock:
             if (link_id not in self._link_proxies
                     and self._pending_link_proxies):
@@ -476,6 +560,39 @@ class PipeWireRegistry:
                 self._on_link_info(link_id, props_dict)
             except Exception:
                 _logger.exception("Error in on_link_info")
+
+    def _metadata_property_cb(self, user_data, metadata_id, subject,
+                              key, type_, value):
+        """Called for each metadata entry at subscribe time, and on
+        every change afterwards. `value` is None when the entry is
+        being removed.
+
+        Returns 0 (accept) as required by the PipeWire metadata
+        callback contract. Failing to return an int would make ctypes
+        raise "NoneType cannot be interpreted as an integer".
+        """
+        key_s = key.decode() if key else ""
+        type_s = type_.decode() if type_ else ""
+        value_s = value.decode() if value else None
+
+        with self._objects_lock:
+            meta_bucket = self.metadata.setdefault(metadata_id, {})
+            subject_bucket = meta_bucket.setdefault(subject, {})
+            if value_s is None:
+                subject_bucket.pop(key_s, None)
+                if not subject_bucket:
+                    meta_bucket.pop(subject, None)
+            else:
+                subject_bucket[key_s] = (type_s, value_s)
+
+        if self._on_metadata_changed is not None:
+            try:
+                self._on_metadata_changed(
+                    metadata_id, subject, key_s, type_s, value_s)
+            except Exception:
+                _logger.exception("Error in on_metadata_changed")
+
+        return 0
 
     # ------------------------------------------------------------------
     # Binding proxies (node / port / link)
@@ -560,17 +677,116 @@ class PipeWireRegistry:
             pw.proxy_destroy(proxy)
 
     # ------------------------------------------------------------------
+    # Metadata accessors
+    # ------------------------------------------------------------------
+
+    def get_metadata(self, subject: int, key: str):
+        """Return (type_spa, raw_value) for (subject, key), or None.
+
+        Walks all bound Metadata objects and returns the first match.
+        The order is deterministic but not meaningful: any Metadata
+        object holding the key is considered authoritative.
+        Returns None if the metadata interface is unavailable.
+        """
+        if not pw.HAVE_METADATA:
+            return None
+        with self._objects_lock:
+            for meta_bucket in self.metadata.values():
+                subject_bucket = meta_bucket.get(subject)
+                if not subject_bucket:
+                    continue
+                entry = subject_bucket.get(key)
+                if entry is not None:
+                    return entry
+        return None
+
+    def get_metadata_json(self, subject: int, key: str):
+        """Return the JSON-decoded value for (subject, key), or None.
+
+        Accepts two cases:
+
+        - the entry is explicitly typed Spa:String:JSON (typical for
+          values published by WirePlumber);
+        - the entry has an empty SPA type (typical for values
+          published by the PipeWire server itself, such as
+          clock.rate). In that case, we still attempt json.loads,
+          because PipeWire stores these values in JSON syntax even
+          when the type is not set.
+
+        Returns None if the entry does not exist, or if the raw value
+        is not valid JSON.
+        """
+        entry = self.get_metadata(subject, key)
+        if entry is None:
+            return None
+        type_s, raw = entry
+        if type_s not in ("", pw.SPA_TYPE_STRING_JSON):
+            return None
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+
+    def set_metadata(self, subject: int, key: str, type_spa: str,
+                     raw_value) -> bool:
+        """Set or clear a metadata entry.
+
+        The value is written to every bound Metadata object.
+        PipeWire silently ignores keys an object does not know.
+        Pass None or empty string to remove the entry.
+
+        Must be called from a thread other than the PipeWire loop
+        thread. Returns True if at least one write succeeded.
+        """
+        if not pw.HAVE_METADATA:
+            return False
+        if not self._running or self._core_lost:
+            return False
+        if not self._metadata_proxies:
+            return False
+
+        key_b = key.encode("utf-8") if key else None
+        type_b = type_spa.encode("utf-8") if type_spa else None
+        if raw_value is None or raw_value == "":
+            value_b = None
+        else:
+            value_b = (raw_value.encode("utf-8")
+                       if isinstance(raw_value, str) else raw_value)
+
+        any_ok = False
+        pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
+        try:
+            for proxy in list(self._metadata_proxies.values()):
+                ret = pw._lib_wrapper.pw_bridge_metadata_set_property(
+                    proxy, subject, key_b, type_b, value_b)
+                if ret >= 0:
+                    any_ok = True
+        finally:
+            pw._lib_wrapper.pw_bridge_thread_loop_unlock(self._thread_loop)
+
+        return any_ok
+
+    def set_metadata_json(self, subject: int, key: str, value) -> bool:
+        """Convenience wrapper for JSON-typed metadata.
+
+        Encodes `value` with json.dumps() and sends it with the SPA
+        type Spa:String:JSON. Pass None to remove the entry.
+        """
+        if not pw.HAVE_METADATA:
+            return False
+        if value is None:
+            return self.set_metadata(subject, key,
+                                     pw.SPA_TYPE_STRING_JSON, None)
+        raw = json.dumps(value)
+        return self.set_metadata(subject, key,
+                                 pw.SPA_TYPE_STRING_JSON, raw)
+
+    # ------------------------------------------------------------------
     # Graph operations
     # ------------------------------------------------------------------
 
     def create_link(self, out_port_id: int, in_port_id: int) -> bool:
-        """Create a link between two ports.
-
-        The call is made under the thread loop lock. This is the
-        pattern used by pw-cli and other PipeWire tools: pw_core_*
-        and pw_proxy_* calls are safe from any thread as long as the
-        thread loop lock is held.
-        """
+        """Create a link between two ports."""
         if not self._running or self._core is None or self._core_lost:
             return False
 
@@ -607,11 +823,7 @@ class PipeWireRegistry:
         return ret >= 0
 
     def rename_client(self, client_id: int, new_name: str) -> bool:
-        """Rename a PipeWire client via client.update-properties.
-
-        The call is made under the thread loop lock, following the
-        same pattern as create_link.
-        """
+        """Rename a PipeWire client via client.update-properties."""
         if not self._running or self._registry is None or self._core_lost:
             return False
 

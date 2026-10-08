@@ -16,11 +16,17 @@
  * pw_proxy_destroy, pw_core_disconnect, pw_context_new, etc.) is
  * called directly via ctypes and does not appear in this file.
  *
+ * Optional interfaces (metadata) are guarded by #ifdef so that the
+ * wrapper compiles on all supported PipeWire versions. The
+ * corresponding Python bindings use try/except AttributeError to
+ * detect at load time whether the interface is available.
+ *
  * Build:
  *   make
  */
 
 #include <pipewire/pipewire.h>
+#include <pipewire/extensions/metadata.h>
 #include <spa/utils/hook.h>
 #include <spa/utils/dict.h>
 #include <stdio.h>
@@ -46,6 +52,10 @@ uint32_t pw_bridge_version_node(void)     { return PW_VERSION_NODE; }
 uint32_t pw_bridge_version_port(void)     { return PW_VERSION_PORT; }
 uint32_t pw_bridge_version_client(void)   { return PW_VERSION_CLIENT; }
 uint32_t pw_bridge_version_device(void)   { return PW_VERSION_DEVICE; }
+
+#ifdef PW_VERSION_METADATA
+uint32_t pw_bridge_version_metadata(void) { return PW_VERSION_METADATA; }
+#endif
 
 
 /* ====================================================================
@@ -502,12 +512,7 @@ void pw_bridge_link_listener_free(struct pw_bridge_link_listener *l)
 /* Link creation.
  *
  * The caller is expected to hold the thread loop lock (via
- * pw_bridge_thread_loop_lock) while calling this function. It is
- * safe to call from any thread provided the lock is held, which
- * is exactly what pw_thread_loop_lock guarantees.
- *
- * The returned proxy must be bound to a listener if the caller
- * wants link.info / link.error events.
+ * pw_bridge_thread_loop_lock) while calling this function.
  */
 struct pw_proxy *pw_bridge_create_link(struct pw_core *core,
                                        uint32_t out_port_id,
@@ -563,6 +568,113 @@ int pw_bridge_client_update_properties(struct pw_proxy *proxy,
     pw_client_update_properties((struct pw_client *)proxy, props);
     return 0;
 }
+
+
+/* ====================================================================
+ * Metadata proxy: bind + listener + set_property
+ *
+ * Available in PipeWire >= 1.2. On older versions, PW_VERSION_METADATA
+ * and PW_TYPE_INTERFACE_Metadata are not defined and the entire
+ * block below is compiled out.
+ *
+ * The metadata_id of the bound object is stored in the listener
+ * struct and passed to the Python callback, so the caller can
+ * distinguish several Metadata objects (there are typically three:
+ * 'default', 'settings', 'route-settings').
+ * ==================================================================== */
+
+#ifdef PW_TYPE_INTERFACE_Metadata
+
+typedef int (*pw_bridge_metadata_property_cb_t)(
+    void *user_data,
+    uint32_t metadata_id,
+    uint32_t subject,
+    const char *key,
+    const char *type,
+    const char *value);
+
+struct pw_bridge_metadata_listener {
+    struct spa_hook                    hook;
+    pw_bridge_metadata_property_cb_t   cb;
+    void                              *user_data;
+    uint32_t                           metadata_id;
+};
+
+static int _metadata_property_relay(void *data, uint32_t subject,
+                                    const char *key, const char *type,
+                                    const char *value)
+{
+    struct pw_bridge_metadata_listener *l = data;
+    if (l->cb == NULL)
+        return 0;
+
+    PyGILState_STATE gil = PyGILState_Ensure();
+    int ret = l->cb(l->user_data, l->metadata_id, subject,
+                    key ? key : "",
+                    type ? type : "",
+                    value);
+    PyGILState_Release(gil);
+    return ret;
+}
+
+static const struct pw_metadata_events g_metadata_events = {
+    .version  = PW_VERSION_METADATA_EVENTS,
+    .property = _metadata_property_relay,
+};
+
+struct pw_proxy *pw_bridge_bind_metadata(struct pw_registry *registry,
+                                         uint32_t metadata_id)
+{
+    if (registry == NULL)
+        return NULL;
+    return (struct pw_proxy *)pw_registry_bind(
+        registry, metadata_id,
+        PW_TYPE_INTERFACE_Metadata, PW_VERSION_METADATA, 0);
+}
+
+struct pw_bridge_metadata_listener *
+pw_bridge_metadata_listener_new(struct pw_proxy *proxy,
+                                pw_bridge_metadata_property_cb_t cb,
+                                void *user_data,
+                                uint32_t metadata_id)
+{
+    if (proxy == NULL)
+        return NULL;
+
+    struct pw_bridge_metadata_listener *l = calloc(1, sizeof(*l));
+    if (l == NULL)
+        return NULL;
+
+    l->cb          = cb;
+    l->user_data   = user_data;
+    l->metadata_id = metadata_id;
+
+    pw_metadata_add_listener((struct pw_metadata *)proxy, &l->hook,
+                             &g_metadata_events, l);
+    return l;
+}
+
+void pw_bridge_metadata_listener_free(struct pw_bridge_metadata_listener *l)
+{
+    if (l == NULL)
+        return;
+    spa_hook_remove(&l->hook);
+    free(l);
+}
+
+int pw_bridge_metadata_set_property(struct pw_proxy *proxy,
+                                    uint32_t subject,
+                                    const char *key,
+                                    const char *type,
+                                    const char *value)
+{
+    if (proxy == NULL)
+        return -1;
+    return pw_metadata_set_property((struct pw_metadata *)proxy,
+                                    subject, key, type, value);
+}
+
+#endif /* PW_TYPE_INTERFACE_Metadata */
 
 
 /* ====================================================================
