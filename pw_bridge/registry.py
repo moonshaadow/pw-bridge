@@ -776,21 +776,34 @@ class PipeWireRegistry:
     # Metadata accessors
     # ------------------------------------------------------------------
 
-    def get_metadata(self, subject: int, key: str):
+    def find_metadata_by_name(self, name: str) -> Optional[int]:
+        """Return the id of the metadata object whose `metadata.name`
+        property matches `name`.
+
+        PipeWire exposes the metadata name in the global properties
+        under the key 'metadata.name' (PW_KEY_METADATA_NAME). This is
+        how `pw-metadata -n` resolves its target. Returns None if no
+        metadata with that name is currently known.
+        """
+        with self._objects_lock:
+            for oid, (type_str, props) in self.objects.items():
+                if type_str != pw.PW_TYPE_INTERFACE_Metadata:
+                    continue
+                if props.get("metadata.name") == name:
+                    return oid
+        return None
+
+    def get_metadata(self, metadata_id: int, subject: int, key: str):
         if not pw.HAVE_METADATA:
             return None
         with self._objects_lock:
-            for meta_bucket in self.metadata.values():
-                subject_bucket = meta_bucket.get(subject)
-                if not subject_bucket:
-                    continue
-                entry = subject_bucket.get(key)
-                if entry is not None:
-                    return entry
-        return None
+            meta_bucket = self.metadata.get(metadata_id)
+            if not meta_bucket:
+                return None
+            return meta_bucket.get(subject, {}).get(key)
 
-    def get_metadata_json(self, subject: int, key: str):
-        entry = self.get_metadata(subject, key)
+    def get_metadata_json(self, metadata_id: int, subject: int, key: str):
+        entry = self.get_metadata(metadata_id, subject, key)
         if entry is None:
             return None
         type_s, raw = entry
@@ -801,13 +814,14 @@ class PipeWireRegistry:
         except (ValueError, TypeError):
             return None
 
-    def set_metadata(self, subject: int, key: str, type_spa: str,
-                     raw_value) -> bool:
+    def set_metadata(self, metadata_id: int, subject: int, key: str,
+                     type_spa: str, raw_value) -> bool:
         if not pw.HAVE_METADATA:
             return False
         if not self._running or self._core_lost:
             return False
-        if not self._metadata_proxies:
+        proxy = self._metadata_proxies.get(metadata_id)
+        if not proxy:
             return False
         key_b = key.encode("utf-8") if key else None
         type_b = type_spa.encode("utf-8") if type_spa else None
@@ -816,26 +830,34 @@ class PipeWireRegistry:
         else:
             value_b = (raw_value.encode("utf-8")
                        if isinstance(raw_value, str) else raw_value)
-        any_ok = False
         pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
         try:
-            for proxy in list(self._metadata_proxies.values()):
-                ret = pw._lib_wrapper.pw_bridge_metadata_set_property(
-                    proxy, subject, key_b, type_b, value_b)
-                if ret >= 0:
-                    any_ok = True
+            ret = pw._lib_wrapper.pw_bridge_metadata_set_property(
+                proxy, subject, key_b, type_b, value_b)
         finally:
             pw._lib_wrapper.pw_bridge_thread_loop_unlock(self._thread_loop)
-        return any_ok
+        return ret >= 0
 
-    def set_metadata_json(self, subject: int, key: str, value) -> bool:
+    def set_metadata_json(self, metadata_id: int, subject: int, key: str,
+                          value) -> bool:
+        """Write a JSON value into the metadata object.
+
+        If value is None, the key is *removed* from the metadata
+        (pw_metadata_set_property is called with a NULL value).
+        To store the JSON literal null, pass the string "null"
+        explicitly, or json.dumps(None).
+
+        Returns True on success. Returns False if the metadata
+        object is unknown, if the connection is down, or if the
+        server rejected the write.
+        """
         if not pw.HAVE_METADATA:
             return False
         if value is None:
-            return self.set_metadata(subject, key,
+            return self.set_metadata(metadata_id, subject, key,
                                      pw.SPA_TYPE_STRING_JSON, None)
         raw = json.dumps(value)
-        return self.set_metadata(subject, key,
+        return self.set_metadata(metadata_id, subject, key,
                                  pw.SPA_TYPE_STRING_JSON, raw)
 
     # ------------------------------------------------------------------
