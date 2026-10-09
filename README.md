@@ -41,9 +41,16 @@ registry.stop()
 
 ## Documentation
 
-See [docs/pw-bridge_API_ref_0.2.1.md](docs/pw-bridge_API_ref_0.2.1.md)
+See [docs/pw-bridge_API_ref_0.2.2.md](docs/pw-bridge_API_ref_0.2.2.md)
 for the full API reference.
 
 ## License
 
 GPL-2.0-or-later.
+
+## Changelog
+
+- **0.2.2** — Metadata targeting by id, `find_metadata_by_name`,
+  loop thread guard fix. Breaking change on the metadata API.
+- **0.2.1** — Device interface, node SPA_PARAM_Props, metadata fixes.
+- **0.2.0** — Initial public release.

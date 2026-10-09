@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pw-bridge"
-version = "0.2.1"
+version = "0.2.2"
 description = "Shared PipeWire C bridge and Python bindings for PCC and Patchanka"
 readme = "README.md"
 requires-python = ">=3.9"
