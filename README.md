@@ -41,7 +41,7 @@ registry.stop()
 
 ## Documentation
 
-See [docs/pw-bridge_API_ref_0.2.md](docs/pw-bridge_API_ref_0.2.md)
+See [docs/pw-bridge_API_ref_0.2.1.md](docs/pw-bridge_API_ref_0.2.1.md)
 for the full API reference.
 
 ## License
