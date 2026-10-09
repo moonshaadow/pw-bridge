@@ -9,6 +9,9 @@ Rule:
     directly through `_lib`;
   - otherwise, it must be exposed by the C wrapper and called
     through `_lib_wrapper`.
+
+Optional interfaces (metadata) are exposed conditionally. Check the
+module-level HAVE_METADATA flag before using them.
 """
 
 import ctypes
@@ -32,14 +35,6 @@ def _load_libpipewire() -> ctypes.CDLL:
 
 
 def _load_wrapper() -> ctypes.CDLL:
-    """Locate libpw_bridge.so.
-
-    Search order:
-      1. PW_BRIDGE_LIBRARY environment variable
-      2. ctypes.util.find_library('pw_bridge')
-      3. alongside the package (development checkout)
-      4. one level up in a 'native' directory (development checkout)
-    """
     env = os.environ.get("PW_BRIDGE_LIBRARY")
     if env:
         p = Path(env)
@@ -78,18 +73,15 @@ _lib_wrapper = _load_wrapper()
 PW_ID_CORE = 0
 PW_ID_ANY  = 0xFFFFFFFF
 
-# Port directions (enum pw_direction)
 PW_DIRECTION_INPUT  = 0
 PW_DIRECTION_OUTPUT = 1
 
-# Node states (enum pw_node_state)
 PW_NODE_STATE_ERROR     = -1
 PW_NODE_STATE_CREATING  = 0
 PW_NODE_STATE_SUSPENDED = 1
 PW_NODE_STATE_IDLE      = 2
 PW_NODE_STATE_RUNNING   = 3
 
-# Link states (enum pw_link_state)
 PW_LINK_STATE_ERROR        = -1
 PW_LINK_STATE_CREATING     = 0
 PW_LINK_STATE_ALLOCATING   = 1
@@ -97,13 +89,42 @@ PW_LINK_STATE_NEGOTIATING  = 2
 PW_LINK_STATE_PAUSED       = 3
 PW_LINK_STATE_ACTIVE       = 4
 
-# Interface type strings
+PW_DEVICE_CHANGE_MASK_PROPS  = 1 << 0
+PW_DEVICE_CHANGE_MASK_PARAMS = 1 << 1
+
+PW_NODE_CHANGE_MASK_INPUT_PORTS  = 1 << 0
+PW_NODE_CHANGE_MASK_OUTPUT_PORTS = 1 << 1
+PW_NODE_CHANGE_MASK_STATE        = 1 << 2
+PW_NODE_CHANGE_MASK_PROPS        = 1 << 3
+PW_NODE_CHANGE_MASK_PARAMS       = 1 << 4
+
 PW_TYPE_INTERFACE_Node     = "PipeWire:Interface:Node"
 PW_TYPE_INTERFACE_Port     = "PipeWire:Interface:Port"
 PW_TYPE_INTERFACE_Link     = "PipeWire:Interface:Link"
 PW_TYPE_INTERFACE_Client   = "PipeWire:Interface:Client"
 PW_TYPE_INTERFACE_Device   = "PipeWire:Interface:Device"
 PW_TYPE_INTERFACE_Metadata = "PipeWire:Interface:Metadata"
+
+SPA_TYPE_STRING_JSON = "Spa:String:JSON"
+
+SPA_PARAM_Invalid      = 0
+SPA_PARAM_PropInfo     = 1
+SPA_PARAM_Props        = 2
+SPA_PARAM_EnumFormat   = 3
+SPA_PARAM_Format       = 4
+SPA_PARAM_EnumProfile  = 32
+SPA_PARAM_Profile      = 33
+SPA_PARAM_EnumRoute    = 34
+SPA_PARAM_Route        = 35
+
+SPA_PROP_volume          = 65539
+SPA_PROP_mute            = 65540
+SPA_PROP_channelVolumes  = 65544
+SPA_PROP_channelMap      = 65547
+
+PW_BRIDGE_PROPS_HAS_VOLUME   = 1 << 0
+PW_BRIDGE_PROPS_HAS_MUTE     = 1 << 1
+PW_BRIDGE_PROPS_HAS_CHANNELS = 1 << 2
 
 
 # --- SPA structures ---------------------------------------------------------
@@ -118,11 +139,6 @@ spa_list._fields_ = [
 
 
 class spa_hook(ctypes.Structure):
-    """Mirror of struct spa_hook.
-
-    Only used as an opaque type. Never instantiate this from Python:
-    the C wrapper allocates and frees the real hooks internally.
-    """
     _fields_ = [
         ("link",    spa_list),
         ("cb",      spa_list),
@@ -155,9 +171,17 @@ class spa_dict(ctypes.Structure):
                 try:
                     result[item.key.decode()] = item.value.decode()
                 except UnicodeDecodeError:
-                    # Skip non-UTF8 values rather than crash.
                     continue
         return result
+
+
+class spa_param_info(ctypes.Structure):
+    _fields_ = [
+        ("id",      ctypes.c_uint32),
+        ("flags",   ctypes.c_uint32),
+        ("user",    ctypes.c_uint32),
+        ("padding", ctypes.c_uint32),
+    ]
 
 
 # --- PipeWire opaque structures ---------------------------------------------
@@ -178,7 +202,7 @@ class pw_proxy(ctypes.Structure):
     pass
 
 
-# --- Callback prototypes (match pw_bridge.c) --------------------------------
+# --- Callback prototypes ----------------------------------------------------
 
 PW_BRIDGE_GLOBAL_CB = ctypes.CFUNCTYPE(
     None,
@@ -199,9 +223,9 @@ PW_BRIDGE_GLOBAL_REMOVE_CB = ctypes.CFUNCTYPE(
 PW_BRIDGE_CORE_INFO_CB = ctypes.CFUNCTYPE(
     None,
     ctypes.c_void_p,
-    ctypes.c_char_p,   # name
-    ctypes.c_char_p,   # version
-    ctypes.c_uint32,   # change_mask
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_uint32,
 )
 
 PW_BRIDGE_CORE_DONE_CB = ctypes.CFUNCTYPE(
@@ -214,44 +238,76 @@ PW_BRIDGE_CORE_DONE_CB = ctypes.CFUNCTYPE(
 PW_BRIDGE_CORE_ERROR_CB = ctypes.CFUNCTYPE(
     None,
     ctypes.c_void_p,
-    ctypes.c_uint32,   # id
-    ctypes.c_int,      # seq
-    ctypes.c_int,      # res
-    ctypes.c_char_p,   # message
+    ctypes.c_uint32,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_char_p,
 )
 
+# Node info: now carries the params list.
 PW_BRIDGE_NODE_INFO_CB = ctypes.CFUNCTYPE(
     None,
-    ctypes.c_void_p,   # user_data
-    ctypes.c_uint32,   # node_id
-    ctypes.c_uint32,   # max_input_ports
-    ctypes.c_uint32,   # max_output_ports
-    ctypes.c_uint32,   # change_mask
-    ctypes.c_int,      # state
-    ctypes.c_char_p,   # error
-    ctypes.POINTER(spa_dict),
+    ctypes.c_void_p,                          # user_data
+    ctypes.c_uint32,                          # node_id
+    ctypes.c_uint32,                          # max_input_ports
+    ctypes.c_uint32,                          # max_output_ports
+    ctypes.c_uint32,                          # change_mask
+    ctypes.c_int,                             # state
+    ctypes.c_char_p,                          # error
+    ctypes.POINTER(spa_dict),                 # props
+    ctypes.POINTER(spa_param_info),           # params
+    ctypes.c_uint32,                          # n_params
+)
+
+PW_BRIDGE_NODE_PARAM_CB = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_int,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_void_p,
 )
 
 PW_BRIDGE_PORT_INFO_CB = ctypes.CFUNCTYPE(
     None,
     ctypes.c_void_p,
-    ctypes.c_uint32,   # port_id
-    ctypes.c_uint32,   # direction
-    ctypes.c_uint32,   # change_mask
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
     ctypes.POINTER(spa_dict),
 )
 
 PW_BRIDGE_LINK_INFO_CB = ctypes.CFUNCTYPE(
     None,
     ctypes.c_void_p,
-    ctypes.c_uint32,   # link_id
-    ctypes.c_uint32,   # output_node_id
-    ctypes.c_uint32,   # output_port_id
-    ctypes.c_uint32,   # input_node_id
-    ctypes.c_uint32,   # input_port_id
-    ctypes.c_int,      # state
-    ctypes.c_char_p,   # error
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_int,
+    ctypes.c_char_p,
     ctypes.POINTER(spa_dict),
+)
+
+PW_BRIDGE_DEVICE_INFO_CB = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.POINTER(spa_dict),
+)
+
+PW_BRIDGE_METADATA_PROPERTY_CB = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_char_p,
 )
 
 
@@ -438,12 +494,39 @@ _lib_wrapper.pw_bridge_bind_node.restype = ctypes.POINTER(pw_proxy)
 _lib_wrapper.pw_bridge_node_listener_new.argtypes = [
     ctypes.POINTER(pw_proxy),
     PW_BRIDGE_NODE_INFO_CB,
+    PW_BRIDGE_NODE_PARAM_CB,
     ctypes.c_void_p,
 ]
 _lib_wrapper.pw_bridge_node_listener_new.restype = ctypes.c_void_p
 
 _lib_wrapper.pw_bridge_node_listener_free.argtypes = [ctypes.c_void_p]
 _lib_wrapper.pw_bridge_node_listener_free.restype = None
+
+_lib_wrapper.pw_bridge_node_enum_params.argtypes = [
+    ctypes.POINTER(pw_proxy),
+    ctypes.c_int,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+]
+_lib_wrapper.pw_bridge_node_enum_params.restype = ctypes.c_int
+
+_lib_wrapper.pw_bridge_node_set_param.argtypes = [
+    ctypes.POINTER(pw_proxy),
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_void_p,
+]
+_lib_wrapper.pw_bridge_node_set_param.restype = ctypes.c_int
+
+_lib_wrapper.pw_bridge_node_param_ids.argtypes = [
+    ctypes.POINTER(spa_param_info),
+    ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint32),
+    ctypes.c_uint32,
+]
+_lib_wrapper.pw_bridge_node_param_ids.restype = ctypes.c_uint32
 
 
 # --- C wrapper: port --------------------------------------------------------
@@ -506,6 +589,99 @@ _lib_wrapper.pw_bridge_client_update_properties.argtypes = [
 _lib_wrapper.pw_bridge_client_update_properties.restype = ctypes.c_int
 
 
+# --- C wrapper: device ------------------------------------------------------
+
+_lib_wrapper.pw_bridge_bind_device.argtypes = [
+    ctypes.POINTER(pw_registry),
+    ctypes.c_uint32,
+]
+_lib_wrapper.pw_bridge_bind_device.restype = ctypes.POINTER(pw_proxy)
+
+_lib_wrapper.pw_bridge_device_listener_new.argtypes = [
+    ctypes.POINTER(pw_proxy),
+    PW_BRIDGE_DEVICE_INFO_CB,
+    ctypes.c_void_p,
+]
+_lib_wrapper.pw_bridge_device_listener_new.restype = ctypes.c_void_p
+
+_lib_wrapper.pw_bridge_device_listener_free.argtypes = [ctypes.c_void_p]
+_lib_wrapper.pw_bridge_device_listener_free.restype = None
+
+
+# --- C wrapper: metadata (optional, PipeWire >= 1.2) ------------------------
+
+HAVE_METADATA = False
+PW_VERSION_METADATA = 0
+
+try:
+    _lib_wrapper.pw_bridge_version_metadata.argtypes = []
+    _lib_wrapper.pw_bridge_version_metadata.restype = ctypes.c_uint32
+
+    _lib_wrapper.pw_bridge_bind_metadata.argtypes = [
+        ctypes.POINTER(pw_registry),
+        ctypes.c_uint32,
+    ]
+    _lib_wrapper.pw_bridge_bind_metadata.restype = ctypes.POINTER(pw_proxy)
+
+    _lib_wrapper.pw_bridge_metadata_listener_new.argtypes = [
+        ctypes.POINTER(pw_proxy),
+        PW_BRIDGE_METADATA_PROPERTY_CB,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    _lib_wrapper.pw_bridge_metadata_listener_new.restype = ctypes.c_void_p
+
+    _lib_wrapper.pw_bridge_metadata_listener_free.argtypes = [ctypes.c_void_p]
+    _lib_wrapper.pw_bridge_metadata_listener_free.restype = None
+
+    _lib_wrapper.pw_bridge_metadata_set_property.argtypes = [
+        ctypes.POINTER(pw_proxy),
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+    ]
+    _lib_wrapper.pw_bridge_metadata_set_property.restype = ctypes.c_int
+
+    PW_VERSION_METADATA = _lib_wrapper.pw_bridge_version_metadata()
+    HAVE_METADATA = True
+except AttributeError:
+    _logger.debug(
+        "Metadata interface not available in this libpipewire version.")
+
+# Note: HAVE_METADATA is determined once at import time, based on
+# the presence of the metadata symbols in the loaded pw_bridge
+# wrapper. In the rare case where the wrapper was compiled against
+# a newer libpipewire than the one loaded at runtime, HAVE_METADATA
+# may be True while pw_bridge_bind_metadata returns NULL. Callers
+# should treat a NULL proxy as "metadata not available" rather than
+# crashing. This is a known limitation, documented but not patched.
+
+
+# --- C wrapper: pod helpers -------------------------------------------------
+
+_lib_wrapper.pw_bridge_pod_parse_props.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint32),
+]
+_lib_wrapper.pw_bridge_pod_parse_props.restype = ctypes.c_uint32
+
+_lib_wrapper.pw_bridge_pod_build_props.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_uint32,
+    ctypes.c_float,
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_uint32,
+]
+_lib_wrapper.pw_bridge_pod_build_props.restype = ctypes.c_void_p
+
+
 # --- C wrapper: thread loop helpers -----------------------------------------
 
 _lib_wrapper.pw_bridge_thread_loop_lock.argtypes = [ctypes.c_void_p]
@@ -518,46 +694,31 @@ _lib_wrapper.pw_bridge_thread_loop_unlock.restype = None
 # --- Helpers ----------------------------------------------------------------
 
 def proxy_destroy(proxy) -> None:
-    """Destroy a proxy.
-
-    Convenience wrapper around the exported pw_proxy_destroy, which
-    is not in the C wrapper because it does not need to be.
-    """
     if proxy:
         _lib.pw_proxy_destroy(proxy)
 
 
 def state_name(state: int) -> str:
-    """Return a human-readable node state name."""
     s = _lib.pw_node_state_as_string(state)
     return s.decode() if s else f"unknown({state})"
 
 
 def link_state_name(state: int) -> str:
-    """Return a human-readable link state name."""
     s = _lib.pw_link_state_as_string(state)
     return s.decode() if s else f"unknown({state})"
 
 
 class SpaDictBuilder:
-    """Build a C spa_dict from a Python dict.
-
-    The returned object owns the underlying buffers. It must be kept
-    alive for the whole duration of the C call that uses the dict.
-    """
-
     def __init__(self, data: dict):
         self._refs: list = []
         n = len(data)
         items_array = (spa_dict_item * n)()
-
         for i, (key, value) in enumerate(data.items()):
             key_b = key.encode("utf-8")
             value_b = value.encode("utf-8")
             self._refs.append(key_b)
             self._refs.append(value_b)
             items_array[i] = spa_dict_item(key_b, value_b)
-
         self._refs.append(items_array)
         self._items_array = items_array
         self.dict = spa_dict(
@@ -575,10 +736,82 @@ class SpaDictBuilder:
 
 
 def spa_dict_from_python(data: dict) -> SpaDictBuilder:
-    """Convenience wrapper. Usage:
-
-        builder = spa_dict_from_python({"key": "value"})
-        ret = _lib_wrapper.pw_bridge_client_update_properties(
-            proxy, ctypes.byref(builder.dict))
-    """
     return SpaDictBuilder(data)
+
+
+# --- SPA pod helpers --------------------------------------------------------
+
+MAX_CHANNELS = 64
+POD_BUFFER_SIZE = 4096
+MAX_PARAM_IDS = 64
+
+
+def pod_parse_props(pod_ptr):
+    if not pod_ptr:
+        return {}
+    vol = ctypes.c_float(0.0)
+    mute = ctypes.c_int(0)
+    chans = (ctypes.c_float * MAX_CHANNELS)()
+    n_chans = ctypes.c_uint32(0)
+
+    bits = _lib_wrapper.pw_bridge_pod_parse_props(
+        pod_ptr,
+        ctypes.byref(vol),
+        ctypes.byref(mute),
+        chans,
+        MAX_CHANNELS,
+        ctypes.byref(n_chans),
+    )
+
+    out = {}
+    if bits & PW_BRIDGE_PROPS_HAS_VOLUME:
+        out["volume"] = float(vol.value)
+    if bits & PW_BRIDGE_PROPS_HAS_MUTE:
+        out["mute"] = bool(mute.value)
+    if bits & PW_BRIDGE_PROPS_HAS_CHANNELS:
+        out["channelVolumes"] = [float(chans[i])
+                                 for i in range(n_chans.value)]
+    return out
+
+
+def pod_build_props(volume=None, mute=None, channel_volumes=None):
+    bits = 0
+    vol = ctypes.c_float(0.0)
+    m = ctypes.c_int(0)
+    chans = None
+    n_chans = 0
+
+    if volume is not None:
+        bits |= PW_BRIDGE_PROPS_HAS_VOLUME
+        vol = ctypes.c_float(float(volume))
+    if mute is not None:
+        bits |= PW_BRIDGE_PROPS_HAS_MUTE
+        m = ctypes.c_int(1 if mute else 0)
+    if channel_volumes:
+        bits |= PW_BRIDGE_PROPS_HAS_CHANNELS
+        n_chans = len(channel_volumes)
+        chans = (ctypes.c_float * n_chans)(*channel_volumes)
+
+    buffer = ctypes.create_string_buffer(POD_BUFFER_SIZE)
+    pod_ptr = _lib_wrapper.pw_bridge_pod_build_props(
+        ctypes.cast(buffer, ctypes.c_void_p),
+        POD_BUFFER_SIZE,
+        bits,
+        vol,
+        m,
+        chans if chans is not None else None,
+        n_chans,
+    )
+    if not pod_ptr:
+        raise RuntimeError("Failed to build SPA_PARAM_Props pod")
+    return buffer, pod_ptr
+
+
+def param_ids_from_info(params_ptr, n_params):
+    """Return the list of param ids exposed by a node."""
+    if not params_ptr or n_params == 0:
+        return []
+    out = (ctypes.c_uint32 * MAX_PARAM_IDS)()
+    n = _lib_wrapper.pw_bridge_node_param_ids(
+        params_ptr, n_params, out, MAX_PARAM_IDS)
+    return [int(out[i]) for i in range(n)]
