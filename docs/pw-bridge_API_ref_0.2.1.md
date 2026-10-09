@@ -15,13 +15,13 @@ PipeWire Control Center, or any other application).
 
 New in this release:
 
-- **Device interface** (§6.7): bind devices, listen to their
+- **Device interface** (§6.12): bind devices, listen to their
   `info` events. The registry binds every Device announced by
   the registry and exposes them through
   `find_object(pw.PW_TYPE_INTERFACE_Device)` and the
   `on_device_info` callback.
 
-- **Node props** (§6.9): read and write SPA_PARAM_Props on
+- **Node props** (§6.13): read and write SPA_PARAM_Props on
   nodes. Exposes `get_node_props`, `set_node_volume`,
   `set_node_mute`, `set_node_channel_volumes`, and the
   asynchronous `request_node_props`. Also
@@ -366,6 +366,7 @@ pw._lib_wrapper.pw_bridge_bind_node(registry, node_id) -> pw_proxy*
 pw._lib_wrapper.pw_bridge_node_listener_new(
     proxy,
     info_cb,            # PW_BRIDGE_NODE_INFO_CB
+    param_cb,           # PW_BRIDGE_NODE_PARAM_CB
     user_data,
 ) -> int
 
@@ -627,14 +628,17 @@ server.
 from pw_bridge import PipeWireRegistry
 
 registry = PipeWireRegistry(
-    on_global_added=callable,      # required
-    on_global_removed=callable,    # required
-    on_node_info=callable,         # optional
-    on_port_info=callable,         # optional
-    on_link_info=callable,         # optional
-    on_core_lost=callable,         # optional
-    on_core_restored=callable,     # optional
-    thread_name="pw_bridge",       # optional, for debug
+    on_global_added=callable,       # required
+    on_global_removed=callable,     # required
+    on_node_info=callable,          # optional
+    on_node_params=callable,        # optional
+    on_port_info=callable,          # optional
+    on_link_info=callable,          # optional
+    on_device_info=callable,        # optional
+    on_metadata_changed=callable,   # optional
+    on_core_lost=callable,          # optional
+    on_core_restored=callable,      # optional
+    thread_name="pw_bridge",        # optional, for debug
 )
 ```
 
@@ -895,9 +899,10 @@ the dict under the lock before iterating.
 `pw_deinit` once at exit. Do not call them from `start()` /
 `stop()`, even though `start()` currently does call `pw_init`.
 
-A future release will move `pw_init` to a module-level
-`pw_bridge.init()` function. For now, calling `pw_init` twice is safe
-because PipeWire reference-counts it.
+Calling `pw_init` twice is safe because PipeWire reference-counts
+it. There is currently no matching `pw_deinit` call in the library;
+if you need it, call it once yourself at process exit, after the
+last registry has been stopped.
 
 ### 11.6 The server does not echo your seq
 
