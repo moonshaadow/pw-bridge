@@ -693,6 +693,12 @@ int pw_bridge_metadata_set_property(struct pw_proxy *proxy,
                                     const char *key, const char *type,
                                     const char *value)
 {
+    /* pw_metadata_set_property is a macro in
+     * <pipewire/extensions/metadata.h>, not an exported symbol of
+     * libpipewire-0.3.so.0 (verify with `nm -D | grep metadata`).
+     * The wrapper is therefore required by the rule stated in the
+     * API reference, section 1.1. Do not attempt to call it via
+     * ctypes directly. */
     if (proxy == NULL)
         return -1;
     return pw_metadata_set_property((struct pw_metadata *)proxy,
