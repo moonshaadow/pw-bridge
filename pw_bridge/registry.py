@@ -432,6 +432,13 @@ class PipeWireRegistry:
             _logger.exception("Error in on_global_removed")
 
     def _core_info_cb(self, user_data, name, version, change_mask):
+        # The first core.info event arrives on the PipeWire loop
+        # thread. Capture its identifier once so that the
+        # anti-deadlock guard in get_node_props can detect calls
+        # made from that thread (which would deadlock: the response
+        # event cannot be delivered while the loop is blocked).
+        if self._loop_thread_id is None:
+            self._loop_thread_id = threading.get_ident()
         name_s = name.decode() if name else ""
         version_s = version.decode() if version else ""
         _logger.debug("Core info: name=%s version=%s", name_s, version_s)
