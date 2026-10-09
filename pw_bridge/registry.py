@@ -6,30 +6,33 @@ made from the loop's thread.
 This module also handles:
 - binding proxies on nodes, ports, links, devices and every
   Metadata object announced by the registry
+- reading and writing SPA_PARAM_Props on nodes (volume, mute,
+  channel volumes)
 - detection of core loss (PipeWire restart) via the `core error`
   and `global_remove(id=0)` events
 - automatic reconnection.
 
 The metadata interface is optional. It requires PipeWire >= 1.2.
-When it is not available (see pw_bindings.HAVE_METADATA), the
-metadata-related methods are no-ops and on_metadata_changed is never
-called.
 
-Metadata layout:
+Node props:
 
-    self.metadata[metadata_id][subject][key] = (type_spa, raw_value)
+    self._node_params_available[node_id] = set of param ids
+    self._node_params_cache[node_id] = {
+        "volume": float,
+        "mute": bool,
+        "channelVolumes": [float, ...],
+    }
 
-PipeWire typically exposes several Metadata objects at once
-('default', 'settings', 'route-settings'...). We bind them all and
-keep them separate. A Metadata object that emits a removal event
-(value=None) only affects its own bucket, so a key published by
-another Metadata object is not clobbered.
+The available-params set is populated by node.info events. It lets
+request_node_props avoid issuing enum_params on nodes that do not
+support SPA_PARAM_Props, which would otherwise cause the server to
+emit "enum params failed" errors.
 
-The accessors (get_metadata / get_metadata_json) walk all Metadata
-objects and return the first match. Writes are sent to every bound
-Metadata; PipeWire silently ignores keys an object does not know.
+The cache is populated by node.param events and by explicit
+requests. get_node_props reads the cache first.
 """
 
+import collections
 import ctypes
 import json
 import logging
@@ -49,6 +52,7 @@ class PipeWireRegistry:
             on_global_added: Callable[[int, str, dict], None],
             on_global_removed: Callable[[int], None],
             on_node_info: Optional[Callable[[int, dict], None]] = None,
+            on_node_params: Optional[Callable[[int, int, dict], None]] = None,
             on_port_info: Optional[Callable[[int, dict], None]] = None,
             on_link_info: Optional[Callable[[int, dict], None]] = None,
             on_device_info: Optional[Callable[[int, dict], None]] = None,
@@ -60,6 +64,7 @@ class PipeWireRegistry:
         self._on_global_added = on_global_added
         self._on_global_removed = on_global_removed
         self._on_node_info = on_node_info
+        self._on_node_params = on_node_params
         self._on_port_info = on_port_info
         self._on_link_info = on_link_info
         self._on_device_info = on_device_info
@@ -73,17 +78,11 @@ class PipeWireRegistry:
         self._core = None
         self._registry = None
 
-        # Per-instance listeners, owned by the C wrapper.
         self._registry_listener = None
         self._core_listener = None
-
-        # Metadata: one proxy and one listener per Metadata object
-        # announced by the registry.
         self._metadata_proxies: dict[int, object] = {}
         self._metadata_listeners: dict[int, object] = {}
 
-        # Strong references to the ctypes callbacks. They MUST live as
-        # long as the corresponding C listeners.
         self._global_cb_c = pw.PW_BRIDGE_GLOBAL_CB(self._registry_global_cb)
         self._global_remove_cb_c = pw.PW_BRIDGE_GLOBAL_REMOVE_CB(
             self._registry_global_remove_cb)
@@ -91,6 +90,8 @@ class PipeWireRegistry:
         self._core_done_cb_c = pw.PW_BRIDGE_CORE_DONE_CB(self._core_done_cb)
         self._core_error_cb_c = pw.PW_BRIDGE_CORE_ERROR_CB(self._core_error_cb)
         self._node_info_cb_c = pw.PW_BRIDGE_NODE_INFO_CB(self._node_info_cb)
+        self._node_param_cb_c = pw.PW_BRIDGE_NODE_PARAM_CB(
+            self._node_param_cb)
         self._port_info_cb_c = pw.PW_BRIDGE_PORT_INFO_CB(self._port_info_cb)
         self._link_info_cb_c = pw.PW_BRIDGE_LINK_INFO_CB(self._link_info_cb)
         self._device_info_cb_c = pw.PW_BRIDGE_DEVICE_INFO_CB(
@@ -104,8 +105,8 @@ class PipeWireRegistry:
 
         self._running = False
         self._core_lost = False
+        self._loop_thread_id: Optional[int] = None
 
-        # Shared state, protected by _objects_lock.
         self._objects_lock = threading.RLock()
         self.objects: dict[int, tuple[str, dict]] = {}
         self._node_listeners: dict[int, int] = {}
@@ -117,16 +118,23 @@ class PipeWireRegistry:
         self._device_listeners: dict[int, int] = {}
         self._device_proxies: dict[int, object] = {}
 
-        # Metadata snapshot, indexed by Metadata object first:
-        #   self.metadata[metadata_id][subject][key] = (type_spa, raw)
-        # A removal event only pops from its own metadata_id bucket.
         self.metadata: dict[int, dict[int, dict[str, tuple[str, str]]]] = {}
 
-        # Proxies created via create_link, waiting for their link.info
-        # event so we can reconcile the real link_id.
+        # Node params.
+        self._node_params_available: dict[int, set] = {}
+        self._node_params_cache: dict[int, dict] = {}
+        self._node_param_waiters: dict[int, list] = {}
+        # FIFO of in-flight enum_params requests. The server does not
+        # echo our seq back; it uses its own counter. We correlate
+        # responses with requests by arrival order, which PipeWire
+        # guarantees for messages on the same object.
+        # Each entry: {"node_id": int, "param_seen": bool}
+        self._node_pending: collections.deque = collections.deque()
+        self._node_seq_counter: int = 0
+        self._sync_seq_counter: int = 0
+
         self._pending_link_proxies: list = []
 
-        # Reconnection thread
         self._reconnect_thread: Optional[threading.Thread] = None
         self._reconnect_stop = threading.Event()
 
@@ -135,26 +143,20 @@ class PipeWireRegistry:
     # ------------------------------------------------------------------
 
     def start(self):
-        """Initialize PipeWire and start the loop."""
         pw._lib.pw_init(None, None)
-
         if not self._create_connection():
             raise RuntimeError("Initial PipeWire connection failed")
-
         self._running = True
         self._core_lost = False
-
         self._reconnect_stop.clear()
         self._reconnect_thread = threading.Thread(
             target=self._reconnect_loop,
             name=f"{self._thread_name}-reconnect",
             daemon=True)
         self._reconnect_thread.start()
-
         _logger.info("PipeWire registry started")
 
     def _create_connection(self) -> bool:
-        """Create the thread loop, context, core and registry."""
         name_b = self._thread_name.encode("utf-8")
         self._thread_loop = pw._lib.pw_thread_loop_new(name_b, None)
         if not self._thread_loop:
@@ -172,7 +174,6 @@ class PipeWireRegistry:
             _logger.error("Failed to connect to the core")
             return False
 
-        # Core listener (per instance).
         self._core_listener = pw._lib_wrapper.pw_bridge_core_listener_new(
             self._core,
             self._core_info_cb_c,
@@ -189,9 +190,6 @@ class PipeWireRegistry:
             _logger.error("Failed to retrieve the registry")
             return False
 
-        # Registry listener (per instance). Nodes, ports, links,
-        # devices and Metadata objects are all discovered through
-        # registry global_added events.
         self._registry_listener = (
             pw._lib_wrapper.pw_bridge_registry_listener_new(
                 self._registry,
@@ -208,23 +206,15 @@ class PipeWireRegistry:
         if ret < 0:
             _logger.error("Failed to start the thread loop")
             return False
-
         return True
 
     def _bind_metadata_locked(self, metadata_id: int):
-        """Bind a Metadata object and attach a listener.
-
-        Must be called with the thread loop lock held, and only when
-        the registry has announced the object. If pw.HAVE_METADATA is
-        False (PipeWire < 1.2), this is a no-op.
-        """
         if not pw.HAVE_METADATA:
             return
         if self._registry is None:
             return
         if metadata_id in self._metadata_proxies:
             return
-
         proxy = pw._lib_wrapper.pw_bridge_bind_metadata(
             self._registry, metadata_id)
         if not proxy:
@@ -247,15 +237,9 @@ class PipeWireRegistry:
         self.metadata.pop(metadata_id, None)
 
     def _destroy_connection(self):
-        """Cleanly destroy the PipeWire connection.
-
-        Every PipeWire operation that touches a proxy, a hook or the
-        core is performed under the thread loop lock.
-        """
         if self._thread_loop:
             pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
         try:
-            # 1. Unbind all proxies.
             with self._objects_lock:
                 for node_id in list(self._node_listeners.keys()):
                     self._unbind_node_locked(node_id)
@@ -272,14 +256,10 @@ class PipeWireRegistry:
                     pw.proxy_destroy(proxy)
                 self._pending_link_proxies.clear()
 
-            # 2. Force a sync so the server processes the pending
-            #    destroy messages before we tear the connection down.
             if self._core is not None:
                 pw._lib_wrapper.pw_bridge_core_sync(
                     self._core, pw.PW_ID_CORE, 0)
 
-            # 3. Free the registry and core listeners while the
-            #    corresponding PipeWire objects are still alive.
             if self._registry_listener:
                 pw._lib_wrapper.pw_bridge_registry_listener_free(
                     self._registry_listener)
@@ -294,14 +274,12 @@ class PipeWireRegistry:
                 pw._lib_wrapper.pw_bridge_thread_loop_unlock(
                     self._thread_loop)
 
-        # 4. Stop the loop.
         if self._thread_loop:
             try:
                 pw._lib.pw_thread_loop_stop(self._thread_loop)
             except Exception:
                 _logger.exception("Error stopping the thread loop")
 
-        # 5. Tear down the PipeWire connection itself.
         if self._core:
             try:
                 pw._lib.pw_core_disconnect(self._core)
@@ -326,21 +304,16 @@ class PipeWireRegistry:
         self._registry = None
 
     def stop(self):
-        """Cleanly stop the connection and the reconnection thread."""
         if not self._running:
             return
-
         self._running = False
         self._reconnect_stop.set()
-
         if self._reconnect_thread:
             self._reconnect_thread.join(timeout=5.0)
             if self._reconnect_thread.is_alive():
                 _logger.error("Reconnect thread did not stop in time")
             self._reconnect_thread = None
-
         self._destroy_connection()
-
         with self._objects_lock:
             self.objects.clear()
             self._node_listeners.clear()
@@ -355,19 +328,13 @@ class PipeWireRegistry:
             self._metadata_proxies.clear()
             self._metadata_listeners.clear()
             self.metadata.clear()
-
+            self._release_all_node_waiters_locked()
         _logger.info("PipeWire registry stopped")
 
-    # ------------------------------------------------------------------
-    # Reconnection thread
-    # ------------------------------------------------------------------
-
     def _reconnect_loop(self):
-        """Monitor the connection and attempt to reconnect."""
         while not self._reconnect_stop.is_set():
             if self._core_lost:
                 _logger.info("Attempting to reconnect to PipeWire...")
-
                 self._destroy_connection()
                 with self._objects_lock:
                     self.objects.clear()
@@ -383,11 +350,10 @@ class PipeWireRegistry:
                     self._metadata_proxies.clear()
                     self._metadata_listeners.clear()
                     self.metadata.clear()
-
+                    self._release_all_node_waiters_locked()
                 if self._create_connection():
                     _logger.info("Reconnection to PipeWire succeeded")
                     self._core_lost = False
-
                     if self._on_core_restored is not None:
                         try:
                             self._on_core_restored()
@@ -395,16 +361,23 @@ class PipeWireRegistry:
                             _logger.exception("Error in on_core_restored")
                 else:
                     _logger.info("Reconnection failed, retrying in 1 second")
-
             self._reconnect_stop.wait(timeout=1.0)
+
+    def _release_all_node_waiters_locked(self):
+        for waiters in self._node_param_waiters.values():
+            for ev in waiters:
+                ev.set()
+        self._node_param_waiters.clear()
+        self._node_params_cache.clear()
+        self._node_params_available.clear()
+        self._node_pending.clear()
 
     # ------------------------------------------------------------------
     # Registry callbacks
     # ------------------------------------------------------------------
 
-    def _registry_global_cb(
-            self, user_data, id_: int, permissions: int,
-            type_: bytes, version: int, props):
+    def _registry_global_cb(self, user_data, id_, permissions,
+                            type_, version, props):
         type_str = type_.decode() if type_ else ""
         props_dict = props.contents.to_dict() if props else {}
 
@@ -433,7 +406,7 @@ class PipeWireRegistry:
         except Exception:
             _logger.exception("Error in on_global_added")
 
-    def _registry_global_remove_cb(self, user_data, id_: int):
+    def _registry_global_remove_cb(self, user_data, id_):
         with self._objects_lock:
             self.objects.pop(id_, None)
             self._unbind_node_locked(id_)
@@ -446,7 +419,6 @@ class PipeWireRegistry:
             if not self._core_lost:
                 _logger.warning("PipeWire core lost (global_remove)")
                 self._core_lost = True
-
                 if self._on_core_lost is not None:
                     try:
                         self._on_core_lost()
@@ -465,11 +437,38 @@ class PipeWireRegistry:
         _logger.debug("Core info: name=%s version=%s", name_s, version_s)
 
     def _core_done_cb(self, user_data, id_, seq):
-        _logger.debug("Core done: id=%s seq=%s", id_, seq)
+        """Called by PipeWire when the server has processed every
+        message up to `seq`.
+
+        We correlate with our in-flight requests by arrival order.
+        The sync we send after enum_params completes the round-trip
+        for the first pending request: whether or not a param event
+        was seen, we release the waiter. If no param was seen, the
+        cache for the node is set to an empty dict.
+        """
+        with self._objects_lock:
+            if not self._node_pending:
+                return
+            entry = self._node_pending.popleft()
+            node_id = entry["node_id"]
+            seen = entry["param_seen"]
+            if not seen:
+                self._node_params_cache.setdefault(node_id, {})
+            for ev in self._node_param_waiters.pop(node_id, []):
+                ev.set()
 
     def _core_error_cb(self, user_data, id_, seq, res, message):
-        """Called when the core reports an error."""
         msg_str = message.decode() if message else ""
+
+        # "enum params id:2 failed" is a legitimate answer from the
+        # server when a node does not expose SPA_PARAM_Props. We now
+        # avoid most of these by checking the node's params list
+        # before issuing enum_params, but a race is still possible
+        # (params list not yet received). Log at debug level.
+        if "enum params id:2" in msg_str:
+            _logger.debug("Core: %s", msg_str)
+            return
+
         _logger.warning("Core error: id=%s seq=%s res=%s msg=%s",
                         id_, seq, res, msg_str)
 
@@ -491,7 +490,7 @@ class PipeWireRegistry:
                     self._metadata_proxies.clear()
                     self._metadata_listeners.clear()
                     self.metadata.clear()
-
+                    self._release_all_node_waiters_locked()
                 if self._on_core_lost is not None:
                     try:
                         self._on_core_lost()
@@ -499,8 +498,8 @@ class PipeWireRegistry:
                         _logger.exception("Error in on_core_lost")
 
     def _node_info_cb(self, user_data, node_id, max_in, max_out,
-                      change_mask, state, error,
-                      props: ctypes.POINTER(pw.spa_dict)):
+                      change_mask, state, error, props,
+                      params_ptr, n_params):
         if not props:
             return
         props_dict = props.contents.to_dict()
@@ -510,7 +509,12 @@ class PipeWireRegistry:
         props_dict["_state"] = state
         props_dict["_error"] = error.decode() if error else ""
 
+        # Record the list of params the node supports.
+        param_ids = pw.param_ids_from_info(params_ptr, n_params)
+        props_dict["_params"] = param_ids
+
         with self._objects_lock:
+            self._node_params_available[node_id] = set(param_ids)
             existing = self.objects.get(node_id)
             if existing is not None:
                 type_str, base_props = existing
@@ -524,14 +528,45 @@ class PipeWireRegistry:
             except Exception:
                 _logger.exception("Error in on_node_info")
 
+    def _node_param_cb(self, user_data, node_id, seq, id_,
+                       index, next_, pod):
+        """Called when the server sends a param response.
+
+        The server's seq does not match ours, so we correlate by
+        arrival order: the response belongs to the first pending
+        request that has not yet seen a param event.
+        """
+        if id_ != pw.SPA_PARAM_Props:
+            return
+        parsed = pw.pod_parse_props(pod) if pod else {}
+
+        with self._objects_lock:
+            # Find the first pending entry that has not yet seen a
+            # param event.
+            target = None
+            for entry in self._node_pending:
+                if not entry["param_seen"]:
+                    target = entry["node_id"]
+                    entry["param_seen"] = True
+                    break
+
+            if target is not None and parsed:
+                bucket = self._node_params_cache.setdefault(target, {})
+                bucket.update(parsed)
+
+        if target is not None and parsed and self._on_node_params is not None:
+            try:
+                self._on_node_params(target, seq, parsed)
+            except Exception:
+                _logger.exception("Error in on_node_params")
+
     def _port_info_cb(self, user_data, port_id, direction, change_mask,
-                      props: ctypes.POINTER(pw.spa_dict)):
+                      props):
         if not props:
             return
         props_dict = props.contents.to_dict()
         props_dict["_direction"] = direction
         props_dict["_change_mask"] = change_mask
-
         with self._objects_lock:
             existing = self.objects.get(port_id)
             if existing is not None:
@@ -539,7 +574,6 @@ class PipeWireRegistry:
                 merged = dict(base_props)
                 merged.update(props_dict)
                 self.objects[port_id] = (type_str, merged)
-
         if self._on_port_info is not None:
             try:
                 self._on_port_info(port_id, props_dict)
@@ -547,8 +581,7 @@ class PipeWireRegistry:
                 _logger.exception("Error in on_port_info")
 
     def _link_info_cb(self, user_data, link_id, out_node, out_port,
-                      in_node, in_port, state, error,
-                      props: ctypes.POINTER(pw.spa_dict)):
+                      in_node, in_port, state, error, props):
         if not props:
             return
         props_dict = props.contents.to_dict()
@@ -558,34 +591,29 @@ class PipeWireRegistry:
         props_dict["_input_port_id"] = in_port
         props_dict["_state"] = state
         props_dict["_error"] = error.decode() if error else ""
-
         with self._objects_lock:
             if (link_id not in self._link_proxies
                     and self._pending_link_proxies):
                 proxy, listener = self._pending_link_proxies.pop(0)
                 self._link_proxies[link_id] = proxy
                 self._link_listeners[link_id] = listener
-
             existing = self.objects.get(link_id)
             if existing is not None:
                 type_str, base_props = existing
                 merged = dict(base_props)
                 merged.update(props_dict)
                 self.objects[link_id] = (type_str, merged)
-
         if self._on_link_info is not None:
             try:
                 self._on_link_info(link_id, props_dict)
             except Exception:
                 _logger.exception("Error in on_link_info")
 
-    def _device_info_cb(self, user_data, device_id, change_mask,
-                        props: ctypes.POINTER(pw.spa_dict)):
+    def _device_info_cb(self, user_data, device_id, change_mask, props):
         if not props:
             return
         props_dict = props.contents.to_dict()
         props_dict["_change_mask"] = change_mask
-
         with self._objects_lock:
             existing = self.objects.get(device_id)
             if existing is not None:
@@ -593,7 +621,6 @@ class PipeWireRegistry:
                 merged = dict(base_props)
                 merged.update(props_dict)
                 self.objects[device_id] = (type_str, merged)
-
         if self._on_device_info is not None:
             try:
                 self._on_device_info(device_id, props_dict)
@@ -602,17 +629,9 @@ class PipeWireRegistry:
 
     def _metadata_property_cb(self, user_data, metadata_id, subject,
                               key, type_, value):
-        """Called for each metadata entry at subscribe time, and on
-        every change afterwards. `value` is None when the entry is
-        being removed.
-
-        Returns 0 (accept) as required by the PipeWire metadata
-        callback contract.
-        """
         key_s = key.decode() if key else ""
         type_s = type_.decode() if type_ else ""
         value_s = value.decode() if value else None
-
         with self._objects_lock:
             meta_bucket = self.metadata.setdefault(metadata_id, {})
             subject_bucket = meta_bucket.setdefault(subject, {})
@@ -622,18 +641,16 @@ class PipeWireRegistry:
                     meta_bucket.pop(subject, None)
             else:
                 subject_bucket[key_s] = (type_s, value_s)
-
         if self._on_metadata_changed is not None:
             try:
                 self._on_metadata_changed(
                     metadata_id, subject, key_s, type_s, value_s)
             except Exception:
                 _logger.exception("Error in on_metadata_changed")
-
         return 0
 
     # ------------------------------------------------------------------
-    # Binding proxies (node / port / link / device)
+    # Binding proxies
     # ------------------------------------------------------------------
 
     def _bind_node(self, node_id: int):
@@ -647,7 +664,8 @@ class PipeWireRegistry:
             if not proxy:
                 return
             listener = pw._lib_wrapper.pw_bridge_node_listener_new(
-                proxy, self._node_info_cb_c, None)
+                proxy, self._node_info_cb_c,
+                self._node_param_cb_c, None)
             if not listener:
                 pw.proxy_destroy(proxy)
                 return
@@ -715,6 +733,13 @@ class PipeWireRegistry:
         proxy = self._node_proxies.pop(node_id, None)
         if proxy:
             pw.proxy_destroy(proxy)
+        self._node_params_cache.pop(node_id, None)
+        self._node_params_available.pop(node_id, None)
+        # Remove any pending requests for this node.
+        self._node_pending = collections.deque(
+            e for e in self._node_pending if e["node_id"] != node_id)
+        for ev in self._node_param_waiters.pop(node_id, []):
+            ev.set()
 
     def _unbind_port_locked(self, port_id: int):
         listener = self._port_listeners.pop(port_id, None)
@@ -745,11 +770,6 @@ class PipeWireRegistry:
     # ------------------------------------------------------------------
 
     def get_metadata(self, subject: int, key: str):
-        """Return (type_spa, raw_value) for (subject, key), or None.
-
-        Walks all bound Metadata objects and returns the first match.
-        Returns None if the metadata interface is unavailable.
-        """
         if not pw.HAVE_METADATA:
             return None
         with self._objects_lock:
@@ -763,21 +783,6 @@ class PipeWireRegistry:
         return None
 
     def get_metadata_json(self, subject: int, key: str):
-        """Return the JSON-decoded value for (subject, key), or None.
-
-        Accepts two cases:
-
-        - the entry is explicitly typed Spa:String:JSON (typical for
-          values published by WirePlumber);
-        - the entry has an empty SPA type (typical for values
-          published by the PipeWire server itself, such as
-          clock.rate). In that case, we still attempt json.loads,
-          because PipeWire stores these values in JSON syntax even
-          when the type is not set.
-
-        Returns None if the entry does not exist, or if the raw value
-        is not valid JSON.
-        """
         entry = self.get_metadata(subject, key)
         if entry is None:
             return None
@@ -791,22 +796,12 @@ class PipeWireRegistry:
 
     def set_metadata(self, subject: int, key: str, type_spa: str,
                      raw_value) -> bool:
-        """Set or clear a metadata entry.
-
-        The value is written to every bound Metadata object.
-        PipeWire silently ignores keys an object does not know.
-        Pass None or empty string to remove the entry.
-
-        Must be called from a thread other than the PipeWire loop
-        thread. Returns True if at least one write succeeded.
-        """
         if not pw.HAVE_METADATA:
             return False
         if not self._running or self._core_lost:
             return False
         if not self._metadata_proxies:
             return False
-
         key_b = key.encode("utf-8") if key else None
         type_b = type_spa.encode("utf-8") if type_spa else None
         if raw_value is None or raw_value == "":
@@ -814,7 +809,6 @@ class PipeWireRegistry:
         else:
             value_b = (raw_value.encode("utf-8")
                        if isinstance(raw_value, str) else raw_value)
-
         any_ok = False
         pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
         try:
@@ -825,15 +819,9 @@ class PipeWireRegistry:
                     any_ok = True
         finally:
             pw._lib_wrapper.pw_bridge_thread_loop_unlock(self._thread_loop)
-
         return any_ok
 
     def set_metadata_json(self, subject: int, key: str, value) -> bool:
-        """Convenience wrapper for JSON-typed metadata.
-
-        Encodes `value` with json.dumps() and sends it with the SPA
-        type Spa:String:JSON. Pass None to remove the entry.
-        """
         if not pw.HAVE_METADATA:
             return False
         if value is None:
@@ -844,27 +832,188 @@ class PipeWireRegistry:
                                  pw.SPA_TYPE_STRING_JSON, raw)
 
     # ------------------------------------------------------------------
+    # Node props (SPA_PARAM_Props)
+    # ------------------------------------------------------------------
+
+    def _next_node_seq(self) -> int:
+        """Return an increasing integer to pass to enum_params.
+
+        PipeWire will replace this seq with its own counter in the
+        param event. We do not rely on it for correlation; it only
+        needs to be a valid monotonically increasing integer.
+        """
+        with self._objects_lock:
+            self._node_seq_counter += 1
+            return self._node_seq_counter
+
+    def _next_sync_seq(self) -> int:
+        """Return an increasing integer to pass to core_sync.
+
+        Same caveat as _next_node_seq: the server has its own
+        counter. We use the FIFO of pending requests to correlate,
+        not this seq.
+        """
+        with self._objects_lock:
+            self._sync_seq_counter += 1
+            return self._sync_seq_counter
+
+    def get_node_params_available(self, node_id: int):
+        """Return the set of param ids the node exposes, or None if
+        node.info has not been received yet."""
+        with self._objects_lock:
+            avail = self._node_params_available.get(node_id)
+            return set(avail) if avail is not None else None
+
+    def request_node_props(self, node_id: int) -> bool:
+        """Asynchronously request SPA_PARAM_Props for a node.
+
+        Returns False immediately if the node is known not to
+        support SPA_PARAM_Props (its params list is available and
+        does not contain the id), which avoids a server-side error.
+        """
+        if not self._running or self._core_lost:
+            return False
+        proxy = self._node_proxies.get(node_id)
+        if not proxy:
+            return False
+
+        with self._objects_lock:
+            avail = self._node_params_available.get(node_id)
+        if avail is not None and pw.SPA_PARAM_Props not in avail:
+            _logger.debug(
+                "Node %d does not expose SPA_PARAM_Props (params=%s)",
+                node_id, sorted(avail))
+            return False
+
+        seq = self._next_node_seq()
+        sync_seq = self._next_sync_seq()
+
+        with self._objects_lock:
+            self._node_pending.append(
+                {"node_id": node_id, "param_seen": False})
+
+        pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
+        try:
+            ret = pw._lib_wrapper.pw_bridge_node_enum_params(
+                proxy, seq, pw.SPA_PARAM_Props, 0, 1, None)
+            if ret >= 0:
+                pw._lib_wrapper.pw_bridge_core_sync(
+                    self._core, pw.PW_ID_CORE, sync_seq)
+            else:
+                # enum_params failed; remove the pending entry we
+                # just added so the FIFO stays consistent.
+                with self._objects_lock:
+                    if self._node_pending and \
+                            self._node_pending[-1]["node_id"] == node_id:
+                        self._node_pending.pop()
+        finally:
+            pw._lib_wrapper.pw_bridge_thread_loop_unlock(self._thread_loop)
+        return ret >= 0
+
+    def get_node_props(self, node_id: int, timeout: float = 2.0) -> dict:
+        if self._loop_thread_id is not None and \
+                threading.get_ident() == self._loop_thread_id:
+            raise RuntimeError(
+                "get_node_props() cannot be called from the "
+                "PipeWire loop thread; use request_node_props() "
+                "instead")
+
+        with self._objects_lock:
+            if node_id not in self._node_proxies:
+                raise KeyError(
+                    f"Node {node_id} is not bound; unknown node or "
+                    f"not a node object")
+
+            cached = self._node_params_cache.get(node_id)
+            if cached is not None:
+                return dict(cached)
+
+            avail = self._node_params_available.get(node_id)
+            # If node.info arrived and the node does not expose Props,
+            # return an empty dict immediately.
+            if avail is not None and pw.SPA_PARAM_Props not in avail:
+                return {}
+
+        ev = threading.Event()
+        with self._objects_lock:
+            self._node_param_waiters.setdefault(node_id, []).append(ev)
+
+        ok = self.request_node_props(node_id)
+        if not ok:
+            with self._objects_lock:
+                waiters = self._node_param_waiters.get(node_id, [])
+                if ev in waiters:
+                    waiters.remove(ev)
+            # The node was bound a moment ago, but the request could
+            # not be sent (connection lost, or Props not available).
+            return {}
+
+        if not ev.wait(timeout):
+            with self._objects_lock:
+                waiters = self._node_param_waiters.get(node_id, [])
+                if ev in waiters:
+                    waiters.remove(ev)
+            raise TimeoutError(
+                f"No Props response for node {node_id} within "
+                f"{timeout}s")
+
+        with self._objects_lock:
+            return dict(self._node_params_cache.get(node_id, {}))
+
+    def set_node_volume(self, node_id: int, volume: float) -> bool:
+        return self._set_node_props(node_id, volume=volume)
+
+    def set_node_mute(self, node_id: int, mute: bool) -> bool:
+        return self._set_node_props(node_id, mute=mute)
+
+    def set_node_channel_volumes(self, node_id: int, volumes) -> bool:
+        return self._set_node_props(
+            node_id, channel_volumes=list(volumes))
+
+    def _set_node_props(self, node_id: int, volume=None, mute=None,
+                        channel_volumes=None) -> bool:
+        if not self._running or self._core_lost:
+            return False
+        proxy = self._node_proxies.get(node_id)
+        if not proxy:
+            return False
+        buffer, pod = pw.pod_build_props(
+            volume=volume, mute=mute,
+            channel_volumes=channel_volumes)
+        pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
+        try:
+            ret = pw._lib_wrapper.pw_bridge_node_set_param(
+                proxy, pw.SPA_PARAM_Props, 0, pod)
+        finally:
+            pw._lib_wrapper.pw_bridge_thread_loop_unlock(self._thread_loop)
+        _ = buffer
+        if ret >= 0:
+            # Invalidate the cache: the next get_node_props() will
+            # re-issue an enum_params and read the value back from
+            # the server, so we stay in sync even if the server
+            # clamped or adjusted the value.
+            with self._objects_lock:
+                self._node_params_cache.pop(node_id, None)
+        return ret >= 0
+
+    # ------------------------------------------------------------------
     # Graph operations
     # ------------------------------------------------------------------
 
     def create_link(self, out_port_id: int, in_port_id: int) -> bool:
-        """Create a link between two ports."""
         if not self._running or self._core is None or self._core_lost:
             return False
-
         pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
         try:
             proxy = pw._lib_wrapper.pw_bridge_create_link(
                 self._core, out_port_id, in_port_id)
             if not proxy:
                 return False
-
             listener = pw._lib_wrapper.pw_bridge_link_listener_new(
                 proxy, self._link_info_cb_c, None)
             if not listener:
                 pw.proxy_destroy(proxy)
                 return False
-
             with self._objects_lock:
                 self._pending_link_proxies.append((proxy, listener))
             return True
@@ -874,21 +1023,17 @@ class PipeWireRegistry:
     def destroy_link(self, link_id: int) -> bool:
         if not self._running or self._registry is None or self._core_lost:
             return False
-
         pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
         try:
             ret = pw._lib_wrapper.pw_bridge_registry_destroy(
                 self._registry, link_id)
         finally:
             pw._lib_wrapper.pw_bridge_thread_loop_unlock(self._thread_loop)
-
         return ret >= 0
 
     def rename_client(self, client_id: int, new_name: str) -> bool:
-        """Rename a PipeWire client via client.update-properties."""
         if not self._running or self._registry is None or self._core_lost:
             return False
-
         pw._lib_wrapper.pw_bridge_thread_loop_lock(self._thread_loop)
         try:
             proxy = pw._lib_wrapper.pw_bridge_bind_client(
@@ -904,7 +1049,6 @@ class PipeWireRegistry:
                 pw.proxy_destroy(proxy)
         finally:
             pw._lib_wrapper.pw_bridge_thread_loop_unlock(self._thread_loop)
-
         return ret >= 0
 
     # ------------------------------------------------------------------
