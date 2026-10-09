@@ -649,6 +649,14 @@ except AttributeError:
     _logger.debug(
         "Metadata interface not available in this libpipewire version.")
 
+# Note: HAVE_METADATA is determined once at import time, based on
+# the presence of the metadata symbols in the loaded pw_bridge
+# wrapper. In the rare case where the wrapper was compiled against
+# a newer libpipewire than the one loaded at runtime, HAVE_METADATA
+# may be True while pw_bridge_bind_metadata returns NULL. Callers
+# should treat a NULL proxy as "metadata not available" rather than
+# crashing. This is a known limitation, documented but not patched.
+
 
 # --- C wrapper: pod helpers -------------------------------------------------
 
