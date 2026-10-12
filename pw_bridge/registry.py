@@ -8,6 +8,8 @@ This module also handles:
   Metadata object announced by the registry
 - reading and writing SPA_PARAM_Props on nodes (volume, mute,
   channel volumes)
+- subscribing to SPA_PARAM_Props changes so that the server emits
+  param events in real time (no polling required)
 - detection of core loss (PipeWire restart) via the `core error`
   and `global_remove(id=0)` events
 - automatic reconnection.
@@ -30,6 +32,16 @@ emit "enum params failed" errors.
 
 The cache is populated by node.param events and by explicit
 requests. get_node_props reads the cache first.
+
+Subscribe to Props:
+
+    After the first node.info for a node, we call
+    pw_node_subscribe_params(SPA_PARAM_Props). The server then emits
+    a param event whenever the Props of that node change. This is
+    what makes volume sliders react to external changes without
+    polling. The subscription is done after node.info (not at bind
+    time) because the proxy must be fully initialized for the
+    subscription to succeed.
 """
 
 import collections
@@ -117,6 +129,12 @@ class PipeWireRegistry:
         self._link_proxies: dict[int, object] = {}
         self._device_listeners: dict[int, int] = {}
         self._device_proxies: dict[int, object] = {}
+
+        # Track which nodes have already been subscribed to
+        # SPA_PARAM_Props. The subscription happens once per node,
+        # after the first node.info event (see _node_info_cb), and
+        # is cleared on unbind.
+        self._node_props_subscribed: set = set()
 
         self.metadata: dict[int, dict[int, dict[str, tuple[str, str]]]] = {}
 
@@ -318,6 +336,7 @@ class PipeWireRegistry:
             self.objects.clear()
             self._node_listeners.clear()
             self._node_proxies.clear()
+            self._node_props_subscribed.clear()
             self._port_listeners.clear()
             self._port_proxies.clear()
             self._link_listeners.clear()
@@ -340,6 +359,7 @@ class PipeWireRegistry:
                     self.objects.clear()
                     self._node_listeners.clear()
                     self._node_proxies.clear()
+                    self._node_props_subscribed.clear()
                     self._port_listeners.clear()
                     self._port_proxies.clear()
                     self._link_listeners.clear()
@@ -487,6 +507,7 @@ class PipeWireRegistry:
                     self.objects.clear()
                     self._node_listeners.clear()
                     self._node_proxies.clear()
+                    self._node_props_subscribed.clear()
                     self._port_listeners.clear()
                     self._port_proxies.clear()
                     self._link_listeners.clear()
@@ -529,6 +550,28 @@ class PipeWireRegistry:
                 merged.update(props_dict)
                 self.objects[node_id] = (type_str, merged)
 
+            # Subscribe to SPA_PARAM_Props the first time we get
+            # info for this node. At this point the proxy is fully
+            # initialized and the subscription will succeed (see
+            # the module docstring for why we do it here rather
+            # than at bind time).
+            if node_id not in self._node_props_subscribed:
+                if pw.SPA_PARAM_Props in param_ids:
+                    proxy = self._node_proxies.get(node_id)
+                    if proxy:
+                        self._node_props_subscribed.add(node_id)
+                        param_id_arr = (ctypes.c_uint32 * 1)(
+                            pw.SPA_PARAM_Props)
+                        ret = pw._lib_wrapper.pw_bridge_node_subscribe_params(
+                            proxy, param_id_arr, 1)
+                        _logger.debug(
+                            "Node %d: subscribe_params(SPA_PARAM_Props) "
+                            "returned %d", node_id, ret)
+                else:
+                    # Mark as subscribed anyway so we do not retry
+                    # on every subsequent info event.
+                    self._node_props_subscribed.add(node_id)
+
         if self._on_node_info is not None:
             try:
                 self._on_node_info(node_id, props_dict)
@@ -539,9 +582,11 @@ class PipeWireRegistry:
                        index, next_, pod):
         """Called when the server sends a param response.
 
-        The server's seq does not match ours, so we correlate by
-        arrival order: the response belongs to the first pending
-        request that has not yet seen a param event.
+        This fires both for enum_params responses and for
+        subscribe_params events. In both cases we update the cache
+        and relay to the callback. The server's seq does not match
+        ours, so for the FIFO of pending requests we correlate by
+        arrival order.
         """
         if id_ != pw.SPA_PARAM_Props:
             return
@@ -549,7 +594,9 @@ class PipeWireRegistry:
 
         with self._objects_lock:
             # Find the first pending entry that has not yet seen a
-            # param event.
+            # param event, and mark it as seen so the matching
+            # core_sync does not overwrite the cache with an empty
+            # dict.
             target = None
             for entry in self._node_pending:
                 if not entry["param_seen"]:
@@ -557,13 +604,17 @@ class PipeWireRegistry:
                     entry["param_seen"] = True
                     break
 
-            if target is not None and parsed:
-                bucket = self._node_params_cache.setdefault(target, {})
+            # Update the cache regardless of whether there is a
+            # pending request: subscribe_params events arrive
+            # without a matching pending entry.
+            cache_key = target if target is not None else node_id
+            if parsed:
+                bucket = self._node_params_cache.setdefault(cache_key, {})
                 bucket.update(parsed)
 
-        if target is not None and parsed and self._on_node_params is not None:
+        if parsed and self._on_node_params is not None:
             try:
-                self._on_node_params(target, seq, parsed)
+                self._on_node_params(node_id, seq, parsed)
             except Exception:
                 _logger.exception("Error in on_node_params")
 
@@ -672,12 +723,15 @@ class PipeWireRegistry:
                 return
             listener = pw._lib_wrapper.pw_bridge_node_listener_new(
                 proxy, self._node_info_cb_c,
-                self._node_param_cb_c, None)
+                self._node_param_cb_c, None,
+                node_id)
             if not listener:
                 pw.proxy_destroy(proxy)
                 return
             self._node_proxies[node_id] = proxy
             self._node_listeners[node_id] = listener
+            # The SPA_PARAM_Props subscription is done later, in
+            # _node_info_cb, once the proxy is fully initialized.
 
     def _bind_port(self, port_id: int):
         if self._registry is None:
@@ -740,6 +794,7 @@ class PipeWireRegistry:
         proxy = self._node_proxies.pop(node_id, None)
         if proxy:
             pw.proxy_destroy(proxy)
+        self._node_props_subscribed.discard(node_id)
         self._node_params_cache.pop(node_id, None)
         self._node_params_available.pop(node_id, None)
         # Remove any pending requests for this node.

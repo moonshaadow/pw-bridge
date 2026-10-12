@@ -244,19 +244,18 @@ PW_BRIDGE_CORE_ERROR_CB = ctypes.CFUNCTYPE(
     ctypes.c_char_p,
 )
 
-# Node info: now carries the params list.
 PW_BRIDGE_NODE_INFO_CB = ctypes.CFUNCTYPE(
     None,
-    ctypes.c_void_p,                          # user_data
-    ctypes.c_uint32,                          # node_id
-    ctypes.c_uint32,                          # max_input_ports
-    ctypes.c_uint32,                          # max_output_ports
-    ctypes.c_uint32,                          # change_mask
-    ctypes.c_int,                             # state
-    ctypes.c_char_p,                          # error
-    ctypes.POINTER(spa_dict),                 # props
-    ctypes.POINTER(spa_param_info),           # params
-    ctypes.c_uint32,                          # n_params
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.POINTER(spa_dict),
+    ctypes.POINTER(spa_param_info),
+    ctypes.c_uint32,
 )
 
 PW_BRIDGE_NODE_PARAM_CB = ctypes.CFUNCTYPE(
@@ -496,6 +495,7 @@ _lib_wrapper.pw_bridge_node_listener_new.argtypes = [
     PW_BRIDGE_NODE_INFO_CB,
     PW_BRIDGE_NODE_PARAM_CB,
     ctypes.c_void_p,
+    ctypes.c_uint32,   # node_id
 ]
 _lib_wrapper.pw_bridge_node_listener_new.restype = ctypes.c_void_p
 
@@ -519,6 +519,15 @@ _lib_wrapper.pw_bridge_node_set_param.argtypes = [
     ctypes.c_void_p,
 ]
 _lib_wrapper.pw_bridge_node_set_param.restype = ctypes.c_int
+
+# pw_node_subscribe_params is an implementation API method, not an
+# exported symbol of libpipewire-0.3.so.0. The C wrapper exposes it.
+_lib_wrapper.pw_bridge_node_subscribe_params.argtypes = [
+    ctypes.POINTER(pw_proxy),
+    ctypes.POINTER(ctypes.c_uint32),
+    ctypes.c_uint32,
+]
+_lib_wrapper.pw_bridge_node_subscribe_params.restype = ctypes.c_int
 
 _lib_wrapper.pw_bridge_node_param_ids.argtypes = [
     ctypes.POINTER(spa_param_info),
@@ -648,14 +657,6 @@ try:
 except AttributeError:
     _logger.debug(
         "Metadata interface not available in this libpipewire version.")
-
-# Note: HAVE_METADATA is determined once at import time, based on
-# the presence of the metadata symbols in the loaded pw_bridge
-# wrapper. In the rare case where the wrapper was compiled against
-# a newer libpipewire than the one loaded at runtime, HAVE_METADATA
-# may be True while pw_bridge_bind_metadata returns NULL. Callers
-# should treat a NULL proxy as "metadata not available" rather than
-# crashing. This is a known limitation, documented but not patched.
 
 
 # --- C wrapper: pod helpers -------------------------------------------------
