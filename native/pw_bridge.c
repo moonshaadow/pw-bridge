@@ -16,6 +16,14 @@
  * pw_proxy_destroy, pw_core_disconnect, pw_context_new, etc.) is
  * called directly via ctypes and does not appear in this file.
  *
+ * Notable implementation-API wrappers:
+ *   - pw_metadata_set_property   (macro, not exported)
+ *   - pw_node_subscribe_params   (implementation API, not exported)
+ *
+ * The node listener carries its own node_id, so that param events
+ * can be tagged with the node they belong to (the C relay callback
+ * does not receive the node id directly).
+ *
  * Build:
  *   make
  */
@@ -241,12 +249,7 @@ void pw_bridge_core_listener_free(struct pw_bridge_core_listener *l)
 
 
 /* ====================================================================
- * Node proxy: bind + info listener + param listener + enum/set param
- *
- * The info callback now exposes the node's params list. Each entry
- * is a (id, flags) pair. This lets the Python side know which params
- * the node supports, in particular SPA_PARAM_Props, before issuing
- * an enum_params that would otherwise fail with -ENOENT.
+ * Node proxy: bind + info listener + param listener + enum/set/subscribe
  * ==================================================================== */
 
 typedef void (*pw_bridge_node_info_cb_t)(
@@ -266,6 +269,7 @@ struct pw_bridge_node_listener {
     pw_bridge_node_info_cb_t    info_cb;
     pw_bridge_node_param_cb_t   param_cb;
     void                       *user_data;
+    uint32_t                    node_id;
 };
 
 static void _node_info_relay(void *data, const struct pw_node_info *info)
@@ -295,7 +299,7 @@ static void _node_param_relay(void *data, int seq, uint32_t id,
     if (l->param_cb == NULL)
         return;
     PyGILState_STATE gil = PyGILState_Ensure();
-    l->param_cb(l->user_data, 0, seq, id, index, next, param);
+    l->param_cb(l->user_data, l->node_id, seq, id, index, next, param);
     PyGILState_Release(gil);
 }
 
@@ -318,7 +322,8 @@ struct pw_bridge_node_listener *
 pw_bridge_node_listener_new(struct pw_proxy *proxy,
                             pw_bridge_node_info_cb_t info_cb,
                             pw_bridge_node_param_cb_t param_cb,
-                            void *user_data)
+                            void *user_data,
+                            uint32_t node_id)
 {
     if (proxy == NULL)
         return NULL;
@@ -328,6 +333,7 @@ pw_bridge_node_listener_new(struct pw_proxy *proxy,
     l->info_cb   = info_cb;
     l->param_cb  = param_cb;
     l->user_data = user_data;
+    l->node_id   = node_id;
     pw_node_add_listener((struct pw_node *)proxy, &l->hook,
                          &g_node_events, l);
     return l;
@@ -357,6 +363,41 @@ int pw_bridge_node_set_param(struct pw_proxy *proxy, uint32_t id,
     if (proxy == NULL)
         return -1;
     return pw_node_set_param((struct pw_node *)proxy, id, flags, param);
+}
+
+/* Subscribe to parameter changes on a node.
+ *
+ * pw_node_subscribe_params is a macro defined as
+ *   pw_node_method(c, subscribe_params, 0, ...)
+ * which expands to
+ *   spa_interface_call_res(iface, method_type, _res, method, vers, ...)
+ * where _res is the proxy pointer. The macro writes the method's
+ * return code into _res (the pointer itself) and returns _res. That
+ * means pw_node_subscribe_params does NOT return the return code.
+ *
+ * To get the actual return code, we call spa_interface_call_res
+ * directly with a proper int variable. The signature is:
+ *
+ *   spa_interface_call_res(iface, method_type, res, method, vers, ...)
+ *
+ * where `res` receives the return code.
+ *
+ * Returns 0 on success, negative errno on failure. */
+int pw_bridge_node_subscribe_params(struct pw_proxy *proxy,
+                                    const uint32_t *ids, uint32_t n_ids)
+{
+    if (proxy == NULL)
+        return -1;
+
+    int res = 0;
+
+    spa_interface_call_res((struct spa_interface *)proxy,
+                           struct pw_node_methods,
+                           res,
+                           subscribe_params, 0,
+                           (uint32_t *)ids, n_ids);
+
+    return res;
 }
 
 /* Copy the ids of a params list into out_ids. Returns the number of
